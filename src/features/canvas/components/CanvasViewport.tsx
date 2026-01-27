@@ -1,5 +1,5 @@
 import type React from "react";
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { AgentTile, CanvasTransform, TilePosition, TileSize } from "@/features/canvas/state/store";
 import { zoomAtScreenPoint } from "@/features/canvas/lib/transform";
 import { AgentTile as AgentTileComponent } from "./AgentTile";
@@ -42,6 +42,8 @@ export const CanvasViewport = ({
   onUpdateTransform,
 }: CanvasViewportProps) => {
   const viewportRef = useRef<HTMLDivElement | null>(null);
+  const [supportsZoom, setSupportsZoom] = useState(false);
+  const [devicePixelRatio, setDevicePixelRatio] = useState(1);
   const transformRef = useRef(transform);
   const pendingTransformRef = useRef<CanvasTransform | null>(null);
   const rafRef = useRef<number | null>(null);
@@ -56,6 +58,23 @@ export const CanvasViewport = ({
   useEffect(() => {
     transformRef.current = transform;
   }, [transform]);
+
+  useEffect(() => {
+    if (typeof document === "undefined") return;
+    setSupportsZoom("zoom" in document.body.style);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const updateRatio = () => {
+      setDevicePixelRatio(window.devicePixelRatio || 1);
+    };
+    updateRatio();
+    window.addEventListener("resize", updateRatio);
+    return () => {
+      window.removeEventListener("resize", updateRatio);
+    };
+  }, []);
 
   const scheduleTransform = useCallback(
     (nextTransform: CanvasTransform) => {
@@ -93,8 +112,10 @@ export const CanvasViewport = ({
         y: event.clientY - rect.top,
       };
       const baseTransform = pendingTransformRef.current ?? transformRef.current;
+      const isPinch =
+        event.ctrlKey && event.deltaMode === WheelEvent.DOM_DELTA_PIXEL;
       const isZoom =
-        event.ctrlKey || event.deltaMode === WheelEvent.DOM_DELTA_LINE;
+        event.metaKey || event.deltaMode === WheelEvent.DOM_DELTA_LINE || isPinch;
 
       event.preventDefault();
 
@@ -165,11 +186,25 @@ export const CanvasViewport = ({
   );
 
   const scaledStyle = useMemo(() => {
+    const snap = (value: number) =>
+      Math.round(value * devicePixelRatio) / devicePixelRatio;
+    const offsetX = snap(transform.offsetX);
+    const offsetY = snap(transform.offsetY);
+
     return {
-      transform: `translate(${transform.offsetX}px, ${transform.offsetY}px) scale(${transform.zoom})`,
+      transform: supportsZoom
+        ? `translate3d(${offsetX}px, ${offsetY}px, 0)`
+        : `translate3d(${offsetX}px, ${offsetY}px, 0) scale(${transform.zoom})`,
       transformOrigin: "0 0",
+      ...(supportsZoom ? { zoom: transform.zoom } : null),
     } as const;
-  }, [transform.offsetX, transform.offsetY, transform.zoom]);
+  }, [
+    devicePixelRatio,
+    supportsZoom,
+    transform.offsetX,
+    transform.offsetY,
+    transform.zoom,
+  ]);
 
   return (
     <div

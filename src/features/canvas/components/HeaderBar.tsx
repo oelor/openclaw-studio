@@ -103,7 +103,7 @@ export const HeaderBar = ({
       <div className="flex flex-wrap items-center gap-3">
         {activeProjectId ? (
           <button
-            className="rounded-full bg-[var(--accent)] px-4 py-2 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+            className="rounded-full bg-[var(--accent-strong)] px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110"
             type="button"
             onClick={onNewAgent}
           >

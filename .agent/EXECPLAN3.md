@@ -203,6 +203,7 @@ Record short evidence snippets here during implementation, such as unit test fai
 - 2026-01-27: Added wheel/pinch zoom + rAF throttling, updated header zoom anchoring, and added Playwright coverage. Playwright wheel events always surfaced as line-based deltas, so trackpad-pan simulation was unreliable; tests cover zoom readout changes and tile bounds updates instead. `npm run test` and `npm run e2e` pass.
 - 2026-01-27: Added SVG minimap + zoom-to-fit helper/button, plus `zoomToFit` unit tests. `npm run test` and `npm run e2e` pass.
 - 2026-01-27: Added overscroll/touch-action guardrails and `will-change: transform` on the scaled canvas content; lint/typecheck/test/e2e pass.
+- 2026-01-27: Switched canvas scaling to use CSS `zoom` when supported (fallback to transform scale) to keep zoomed text crisp.
 
 ## Interfaces and Dependencies
 
