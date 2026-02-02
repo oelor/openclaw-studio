@@ -79,6 +79,24 @@ export async function PUT(request: Request) {
       );
     }
 
+    try {
+      fs.accessSync(resolvedPath, fs.constants.R_OK);
+    } catch {
+      return NextResponse.json(
+        { error: `Workspace path is not readable: ${resolvedPath}` },
+        { status: 403 }
+      );
+    }
+
+    try {
+      fs.accessSync(resolvedPath, fs.constants.W_OK);
+    } catch {
+      return NextResponse.json(
+        { error: `Workspace path is not writable: ${resolvedPath}` },
+        { status: 403 }
+      );
+    }
+
     saveWorkspaceSettings({
       workspacePath: resolvedPath,
       workspaceName: workspaceName || undefined,

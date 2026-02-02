@@ -33,13 +33,14 @@ export function CanvasOnboardingPanel({
   if (!blocker) return null;
 
   if (blocker === "gateway") {
-    const command = "openclaw gateway start";
+    const statusCommand = "openclaw gateway status";
+    const startCommand = "openclaw gateway start";
     const title =
       gatewayStatus === "connecting" ? "Connecting to Gateway…" : "Gateway disconnected";
     const body =
       gatewayStatus === "connecting"
-        ? "Studio can’t run agents until the Gateway is online. If this takes more than a few seconds, start the Gateway manually."
-        : "Studio can’t run agents until the Gateway is online. Start it in a terminal:";
+        ? "Studio can’t run agents until the Gateway is online. If this takes more than a few seconds, check the status or start it manually:"
+        : "Studio can’t run agents until the Gateway is online. Check status and start it in a terminal:";
 
     return (
       <div className="glass-panel px-6 py-5">
@@ -49,11 +50,28 @@ export function CanvasOnboardingPanel({
             <p className="text-sm text-muted-foreground">{body}</p>
           </div>
 
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            <code className="rounded-md border border-border bg-background px-3 py-2 text-xs text-foreground">
-              {command}
-            </code>
-            <CopyButton text={command} label="Copy command" successMessage="Gateway command copied." />
+          <div className="flex flex-col gap-2">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <code className="rounded-md border border-border bg-background px-3 py-2 text-xs text-foreground">
+                {statusCommand}
+              </code>
+              <CopyButton
+                text={statusCommand}
+                label="Copy status command"
+                successMessage="Gateway status command copied."
+              />
+            </div>
+
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+              <code className="rounded-md border border-border bg-background px-3 py-2 text-xs text-foreground">
+                {startCommand}
+              </code>
+              <CopyButton
+                text={startCommand}
+                label="Copy start command"
+                successMessage="Gateway start command copied."
+              />
+            </div>
           </div>
 
           <p className="text-xs text-muted-foreground">

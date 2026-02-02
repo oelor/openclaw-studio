@@ -126,6 +126,28 @@ export const resolveWorkspaceSelection = (): {
         warnings.push(`Workspace path is not a directory: ${workspacePath}`);
         workspacePath = null;
         workspaceName = null;
+      } else {
+        const target = workspacePath;
+        let valid = true;
+
+        try {
+          fs.accessSync(target, fs.constants.R_OK);
+        } catch {
+          warnings.push(`Workspace path is not readable: ${target}`);
+          valid = false;
+        }
+
+        try {
+          fs.accessSync(target, fs.constants.W_OK);
+        } catch {
+          warnings.push(`Workspace path is not writable: ${target}`);
+          valid = false;
+        }
+
+        if (!valid) {
+          workspacePath = null;
+          workspaceName = null;
+        }
       }
     } catch (err) {
       const message =

@@ -59,11 +59,97 @@ export const WorkspaceSettingsPanel = ({
     };
   }, []);
 
+  useEffect(() => {
+    if (loading) return;
+    const trimmed = workspacePath.trim();
+    if (!trimmed) {
+      setPathCheck(null);
+      setPathCheckError(null);
+      setPathChecking(false);
+      return;
+    }
+
+    let cancelled = false;
+    setPathChecking(true);
+    setPathCheck(null);
+    setPathCheckError(null);
+
+    const timer = window.setTimeout(() => {
+      void fetch(`/api/path-check?p=${encodeURIComponent(trimmed)}`)
+        .then(async (res) => {
+          const json = (await res.json()) as unknown;
+          if (cancelled) return;
+          if (!res.ok) {
+            const message =
+              json && typeof json === "object" && "error" in json
+                ? String((json as { error?: unknown }).error ?? "")
+                : "Failed to validate path.";
+            setPathCheck(null);
+            setPathCheckError(message || "Failed to validate path.");
+            return;
+          }
+          setPathCheck(json as PathCheckResult);
+          setPathCheckError(null);
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          const message = err instanceof Error ? err.message : "Failed to validate path.";
+          setPathCheck(null);
+          setPathCheckError(message);
+        })
+        .finally(() => {
+          if (cancelled) return;
+          setPathChecking(false);
+        });
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [loading, workspacePath]);
+
   const trimmedPath = workspacePath.trim();
   const pathLooksValid =
-    !trimmedPath || trimmedPath.startsWith("/") || trimmedPath === "~" || trimmedPath.startsWith("~/");
+    !trimmedPath ||
+    trimmedPath.startsWith("/") ||
+    trimmedPath === "~" ||
+    trimmedPath.startsWith("~/");
+
   const pathHelpText =
-    "Use an absolute path (e.g. /Users/you/code) or ~ / ~/... . Studio will verify it exists and is a directory when you save.";
+    "Use an absolute path (e.g. /Users/you/code) or ~ / ~/... . Studio will validate it exists and is a readable/writable directory.";
+
+  const pathCheckFailure = useMemo(() => {
+    if (!pathCheck) return null;
+    if (!pathCheck.exists) return `Path does not exist: ${pathCheck.resolvedPath}`;
+    if (!pathCheck.isDirectory) return `Path is not a directory: ${pathCheck.resolvedPath}`;
+    if (!pathCheck.readable) return `Path is not readable: ${pathCheck.resolvedPath}`;
+    if (!pathCheck.writable) return `Path is not writable: ${pathCheck.resolvedPath}`;
+    return null;
+  }, [pathCheck]);
+
+  const canSave = useMemo(() => {
+    if (loading || saving) return false;
+    if (!trimmedPath) return false;
+    if (!pathLooksValid) return false;
+
+    // Don’t allow saving until we’ve validated the path.
+    if (pathChecking) return false;
+    if (pathCheckError) return false;
+    if (!pathCheck) return false;
+
+    if (pathCheckFailure) return false;
+    return true;
+  }, [
+    loading,
+    pathCheck,
+    pathCheckError,
+    pathCheckFailure,
+    pathChecking,
+    pathLooksValid,
+    saving,
+    trimmedPath,
+  ]);
 
   const handleSave = useCallback(async () => {
     const trimmedPath = workspacePath.trim();
@@ -73,6 +159,22 @@ export const WorkspaceSettingsPanel = ({
     }
     if (!(trimmedPath.startsWith("/") || trimmedPath === "~" || trimmedPath.startsWith("~/"))) {
       setError("Workspace path must be an absolute path (or ~).");
+      return;
+    }
+    if (pathChecking) {
+      setError("Validating workspace path…");
+      return;
+    }
+    if (pathCheckError) {
+      setError(`Could not validate workspace path: ${pathCheckError}`);
+      return;
+    }
+    if (!pathCheck) {
+      setError("Workspace path has not been validated yet.");
+      return;
+    }
+    if (pathCheckFailure) {
+      setError(pathCheckFailure);
       return;
     }
     setSaving(true);
@@ -99,7 +201,7 @@ export const WorkspaceSettingsPanel = ({
     } finally {
       setSaving(false);
     }
-  }, [onSaved, toast, workspacePath]);
+  }, [onSaved, pathCheck, pathCheckError, pathCheckFailure, pathChecking, toast, workspacePath]);
 
   return (
     <div className="glass-panel px-6 py-6" data-testid="workspace-settings-panel">
@@ -140,6 +242,22 @@ export const WorkspaceSettingsPanel = ({
               <span className="text-[11px] font-normal normal-case tracking-normal text-destructive">
                 Path must start with <code>/</code> or use <code>~</code> / <code>~/</code>.
               </span>
+            ) : trimmedPath && pathChecking ? (
+              <span className="text-[11px] font-normal normal-case tracking-normal text-muted-foreground">
+                Checking path…
+              </span>
+            ) : trimmedPath && pathCheckError ? (
+              <span className="text-[11px] font-normal normal-case tracking-normal text-muted-foreground">
+                Could not validate path: {pathCheckError}
+              </span>
+            ) : trimmedPath && pathCheckFailure ? (
+              <span className="text-[11px] font-normal normal-case tracking-normal text-destructive">
+                {pathCheckFailure}
+              </span>
+            ) : trimmedPath && pathCheck ? (
+              <span className="text-[11px] font-normal normal-case tracking-normal text-emerald-600">
+                Looks good: <code>{pathCheck.resolvedPath}</code>
+              </span>
             ) : null}
           </label>
         </div>
@@ -149,7 +267,7 @@ export const WorkspaceSettingsPanel = ({
             className="rounded-lg bg-primary px-5 py-2 text-sm font-semibold text-primary-foreground transition hover:brightness-110 disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground"
             type="button"
             onClick={handleSave}
-            disabled={loading || saving || !pathLooksValid}
+            disabled={!canSave}
             data-testid="workspace-settings-save"
           >
             {saving ? "Saving..." : "Save settings"}
