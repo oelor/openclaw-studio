@@ -6,6 +6,8 @@ import { CanvasFlow } from "@/features/canvas/components/CanvasFlow";
 import { AgentInspectPanel } from "@/features/canvas/components/AgentInspectPanel";
 import { HeaderBar } from "@/features/canvas/components/HeaderBar";
 import { WorkspaceSettingsPanel } from "@/features/canvas/components/WorkspaceSettingsPanel";
+import { useToast } from "@/components/ui/toast";
+import { useConfirm } from "@/components/ui/confirm";
 import { MAX_TILE_HEIGHT, MIN_TILE_SIZE } from "@/lib/canvasTileDefaults";
 import { screenToWorld, worldToScreen } from "@/features/canvas/lib/transform";
 import {
@@ -267,6 +269,8 @@ const findTileByRunId = (
 
 const AgentCanvasPage = () => {
   const { client, status } = useGatewayConnection();
+  const { toast } = useToast();
+  const { confirm } = useConfirm();
 
   const {
     state,
@@ -1015,7 +1019,11 @@ const AgentCanvasPage = () => {
     async (tileId: string, sessionKey: string, message: string) => {
       if (!project) return;
       if (needsWorkspace) {
-        window.alert("Set a workspace path before sending instructions.");
+        toast({
+          variant: "warning",
+          title: "Workspace required",
+          message: "Set a workspace path before sending instructions.",
+        });
         return;
       }
       const trimmed = message.trim();
@@ -1102,7 +1110,7 @@ const AgentCanvasPage = () => {
         });
       }
     },
-    [client, dispatch, needsWorkspace, project]
+    [client, dispatch, needsWorkspace, project, toast]
   );
 
   const handleModelChange = useCallback(
@@ -1512,40 +1520,78 @@ const AgentCanvasPage = () => {
     try {
       const preview = await fetchProjectCleanupPreview();
       if (preview.items.length === 0) {
-        window.alert("No archived agents to clean.");
+        toast({
+          variant: "default",
+          title: "Nothing to clean",
+          message: "No archived agents to clean.",
+        });
         return;
       }
-      const confirmation = window.confirm(
-        `Remove ${preview.items.length} archived agents?`
-      );
+
+      const confirmation = await confirm({
+        title: "Clean archived agents?",
+        description: `Remove ${preview.items.length} archived agent${
+          preview.items.length === 1 ? "" : "s"
+        } from this project? This cannot be undone.`,
+        confirmText: "Remove",
+        cancelText: "Cancel",
+        destructive: true,
+      });
       if (!confirmation) return;
+
       const result = await runProjectCleanup({
         tileIds: preview.items.map((item) => item.tileId),
       });
       dispatch({ type: "loadStore", store: result.store });
+
       if (result.warnings.length) {
-        window.alert(result.warnings.join("\n"));
+        toast({
+          variant: "warning",
+          title: "Cleaned with warnings",
+          message: result.warnings.join(" "),
+        });
+      } else {
+        toast({
+          variant: "success",
+          title: "Cleaned",
+          message: `Removed ${preview.items.length} archived agent${
+            preview.items.length === 1 ? "" : "s"
+          }.`,
+        });
       }
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to clean archived agents.";
-      window.alert(message);
+      console.error(message);
+      toast({ variant: "destructive", title: "Cleanup failed", message });
     }
-  }, [dispatch]);
+  }, [confirm, dispatch, toast]);
 
   const handleCreateDiscordChannel = useCallback(async () => {
     if (!project || project.archivedAt) return;
     if (needsWorkspace) {
-      window.alert("Set a workspace path first.");
+      toast({
+        variant: "warning",
+        title: "Workspace required",
+        message: "Set a workspace path first.",
+      });
       return;
     }
     if (!state.selectedTileId) {
-      window.alert("Select an agent tile first.");
+      toast({
+        variant: "warning",
+        title: "Select an agent",
+        message: "Select an agent tile first.",
+      });
       return;
     }
     const tile = project.tiles.find((entry) => entry.id === state.selectedTileId);
     if (!tile) {
-      window.alert("Selected agent not found.");
+      toast({
+        variant: "destructive",
+        title: "Selection lost",
+        message: "Selected agent not found.",
+      });
       return;
     }
     try {
@@ -1555,16 +1601,21 @@ const AgentCanvasPage = () => {
       });
       const notice = `Created Discord channel #${result.channelName} for ${tile.name}.`;
       if (result.warnings.length) {
-        window.alert(`${notice}\n${result.warnings.join("\n")}`);
+        toast({
+          variant: "warning",
+          title: "Channel created (warnings)",
+          message: `${notice} ${result.warnings.join(" ")}`,
+        });
       } else {
-        window.alert(notice);
+        toast({ variant: "success", title: "Channel created", message: notice });
       }
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "Failed to create Discord channel.";
-      window.alert(message);
+      console.error(message);
+      toast({ variant: "destructive", title: "Discord channel failed", message });
     }
-  }, [needsWorkspace, project, state.selectedTileId]);
+  }, [needsWorkspace, project, state.selectedTileId, toast]);
 
   const handleTileDelete = useCallback(
     async (tileId: string) => {
@@ -1578,10 +1629,14 @@ const AgentCanvasPage = () => {
         setInspectTileId(null);
       }
       if (result?.warnings.length) {
-        window.alert(result.warnings.join("\n"));
+        toast({
+          variant: "warning",
+          title: "Completed with warnings",
+          message: result.warnings.join(" "),
+        });
       }
     },
-    [deleteTile, inspectTileId, project, restoreTile]
+    [deleteTile, inspectTileId, project, restoreTile, toast]
   );
 
   const handleAvatarShuffle = useCallback(
@@ -1591,14 +1646,18 @@ const AgentCanvasPage = () => {
       const result = await updateTile(project.id, tileId, { avatarSeed });
       if (!result) return;
       if ("error" in result) {
-        window.alert(result.error);
+        toast({ variant: "destructive", title: "Update failed", message: result.error });
         return;
       }
       if (result.warnings.length > 0) {
-        window.alert(result.warnings.join("\n"));
+        toast({
+          variant: "warning",
+          title: "Updated with warnings",
+          message: result.warnings.join(" "),
+        });
       }
     },
-    [project, updateTile]
+    [project, toast, updateTile]
   );
 
   const handleNameShuffle = useCallback(
@@ -1608,14 +1667,18 @@ const AgentCanvasPage = () => {
       const result = await renameTile(project.id, tileId, normalizeAgentName(name));
       if (!result) return;
       if ("error" in result) {
-        window.alert(result.error);
+        toast({ variant: "destructive", title: "Rename failed", message: result.error });
         return;
       }
       if (result.warnings.length > 0) {
-        window.alert(result.warnings.join("\n"));
+        toast({
+          variant: "warning",
+          title: "Renamed with warnings",
+          message: result.warnings.join(" "),
+        });
       }
     },
-    [project, renameTile]
+    [project, renameTile, toast]
   );
 
   return (
@@ -1660,11 +1723,15 @@ const AgentCanvasPage = () => {
           return renameTile(project.id, id, name).then((result) => {
             if (!result) return false;
             if ("error" in result) {
-              window.alert(result.error);
+              toast({ variant: "destructive", title: "Rename failed", message: result.error });
               return false;
             }
             if (result.warnings.length > 0) {
-              window.alert(result.warnings.join("\n"));
+              toast({
+                variant: "warning",
+                title: "Renamed with warnings",
+                message: result.warnings.join(" "),
+              });
             }
             return true;
           });

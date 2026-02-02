@@ -4,6 +4,7 @@ import {
   fetchWorkspaceSettings,
   updateWorkspaceSettings,
 } from "@/lib/projects/client";
+import { useToast } from "@/components/ui/toast";
 
 type WorkspaceSettingsPanelProps = {
   onClose: () => void;
@@ -14,6 +15,7 @@ export const WorkspaceSettingsPanel = ({
   onClose,
   onSaved,
 }: WorkspaceSettingsPanelProps) => {
+  const { toast } = useToast();
   const [workspacePath, setWorkspacePath] = useState("");
   const [warnings, setWarnings] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -58,7 +60,13 @@ export const WorkspaceSettingsPanel = ({
       });
       setWarnings(result.warnings ?? []);
       if (result.warnings.length > 0) {
-        window.alert(result.warnings.join("\n"));
+        toast({
+          variant: "warning",
+          title: "Saved with warnings",
+          message: result.warnings.join(" "),
+        });
+      } else {
+        toast({ variant: "success", title: "Saved", message: "Workspace settings updated." });
       }
       onSaved();
     } catch (err) {
@@ -68,7 +76,7 @@ export const WorkspaceSettingsPanel = ({
     } finally {
       setSaving(false);
     }
-  }, [onSaved, workspacePath]);
+  }, [onSaved, toast, workspacePath]);
 
   return (
     <div className="glass-panel px-6 py-6" data-testid="workspace-settings-panel">
