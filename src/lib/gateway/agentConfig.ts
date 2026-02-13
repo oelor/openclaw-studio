@@ -325,6 +325,39 @@ const applyGatewayConfigPatch = async (params: {
   }
 };
 
+const applyGatewayConfigSet = async (params: {
+  client: GatewayClient;
+  config: Record<string, unknown>;
+  baseHash?: string | null;
+  exists?: boolean;
+  attempt?: number;
+}): Promise<void> => {
+  const attempt = params.attempt ?? 0;
+  const requiresBaseHash = params.exists !== false;
+  const baseHash = requiresBaseHash ? params.baseHash?.trim() : undefined;
+  if (requiresBaseHash && !baseHash) {
+    throw new Error("Gateway config hash unavailable; re-run config.get.");
+  }
+  const payload: Record<string, unknown> = {
+    raw: JSON.stringify(params.config, null, 2),
+  };
+  if (baseHash) payload.baseHash = baseHash;
+  try {
+    await params.client.call("config.set", payload);
+  } catch (err) {
+    if (attempt < 1 && shouldRetryConfigWrite(err)) {
+      const snapshot = await params.client.call<GatewayConfigSnapshot>("config.get", {});
+      return applyGatewayConfigSet({
+        ...params,
+        baseHash: snapshot.hash ?? undefined,
+        exists: snapshot.exists,
+        attempt: attempt + 1,
+      });
+    }
+    throw err;
+  }
+};
+
 export const renameGatewayAgent = async (params: {
   client: GatewayClient;
   agentId: string;
@@ -537,9 +570,10 @@ export const updateGatewayAgentOverrides = async (params: {
     return next;
   });
 
-  await applyGatewayConfigPatch({
+  const nextConfig = writeConfigAgentList(baseConfig, nextList);
+  await applyGatewayConfigSet({
     client: params.client,
-    patch: { agents: { list: nextList } },
+    config: nextConfig,
     baseHash: snapshot.hash ?? undefined,
     exists: snapshot.exists,
   });

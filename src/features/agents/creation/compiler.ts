@@ -165,7 +165,7 @@ const CONTROL_DEFAULTS: Record<AgentControlLevel, ControlDefaults> = {
   conservative: {
     execAutonomy: "ask-first",
     fileEditAutonomy: "propose-only",
-    sandboxMode: "non-main",
+    sandboxMode: "all",
     workspaceAccess: "ro",
     approvalSecurity: "allowlist",
     approvalAsk: "always",
@@ -392,6 +392,11 @@ export const compileGuidedAgentCreation = (params: {
   } else {
     ensureToolDeny.add("group:runtime");
     ensureToolAlsoAllow.delete("group:runtime");
+  }
+  if (params.draft.controls.fileEditAutonomy === "propose-only") {
+    ensureToolDeny.add("write");
+    ensureToolDeny.add("edit");
+    ensureToolDeny.add("apply_patch");
   }
 
   const normalizedAlsoAllow = Array.from(ensureToolAlsoAllow);

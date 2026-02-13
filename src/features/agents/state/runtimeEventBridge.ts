@@ -41,7 +41,7 @@ export type LifecycleTransition =
   | LifecycleTransitionIgnore;
 
 type ShouldPublishAssistantStreamInput = {
-  mergedRaw: string;
+  nextText: string;
   rawText: string;
   hasChatEvents: boolean;
   currentStreamText: string | null;
@@ -462,15 +462,19 @@ export const resolveLifecyclePatch = (input: LifecyclePatchInput): LifecycleTran
 };
 
 export const shouldPublishAssistantStream = ({
-  mergedRaw,
+  nextText,
   rawText,
   hasChatEvents,
   currentStreamText,
 }: ShouldPublishAssistantStreamInput): boolean => {
-  if (!mergedRaw.trim()) return false;
+  const next = nextText.trim();
+  if (!next) return false;
   if (!hasChatEvents) return true;
   if (rawText.trim()) return true;
-  return !currentStreamText?.trim();
+  const current = currentStreamText?.trim() ?? "";
+  if (!current) return true;
+  if (next.length <= current.length) return false;
+  return next.startsWith(current);
 };
 
 export const getChatSummaryPatch = (

@@ -48,13 +48,16 @@ describe("compileGuidedAgentCreation", () => {
 
     expect(result.validation.errors).toEqual([]);
     expect(result.agentOverrides.sandbox).toEqual({
-      mode: "non-main",
+      mode: "all",
       workspaceAccess: "ro",
     });
     expect(result.agentOverrides.tools?.profile).toBe("minimal");
     expect(result.agentOverrides.tools?.allow).toBeUndefined();
     expect(result.agentOverrides.tools?.alsoAllow).toContain("group:web");
     expect(result.agentOverrides.tools?.deny).toContain("group:runtime");
+    expect(result.agentOverrides.tools?.deny).toContain("write");
+    expect(result.agentOverrides.tools?.deny).toContain("edit");
+    expect(result.agentOverrides.tools?.deny).toContain("apply_patch");
     expect(result.execApprovals).toBeNull();
   });
 
@@ -77,6 +80,9 @@ describe("compileGuidedAgentCreation", () => {
     expect(result.agentOverrides.tools?.profile).toBe("coding");
     expect(result.agentOverrides.tools?.alsoAllow).toContain("group:runtime");
     expect(result.agentOverrides.tools?.deny).not.toContain("group:runtime");
+    expect(result.agentOverrides.tools?.deny).toContain("write");
+    expect(result.agentOverrides.tools?.deny).toContain("edit");
+    expect(result.agentOverrides.tools?.deny).toContain("apply_patch");
     expect(result.execApprovals).toEqual({
       security: "allowlist",
       ask: "on-miss",
@@ -101,6 +107,9 @@ describe("compileGuidedAgentCreation", () => {
     expect(result.agentOverrides.tools?.profile).toBe("messaging");
     expect(result.agentOverrides.tools?.alsoAllow).toContain("group:web");
     expect(result.agentOverrides.tools?.deny).toContain("group:runtime");
+    expect(result.agentOverrides.tools?.deny).toContain("write");
+    expect(result.agentOverrides.tools?.deny).toContain("edit");
+    expect(result.agentOverrides.tools?.deny).toContain("apply_patch");
     expect(result.execApprovals).toBeNull();
   });
 

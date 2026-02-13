@@ -110,7 +110,7 @@ describe("guided setup recovery", () => {
             config: { agents: { list: [{ id: "agent-1" }] } },
           };
         }
-        if (method === "config.patch") return { ok: true };
+        if (method === "config.set") return { ok: true };
         if (method === "agents.files.set") return { ok: true };
         if (method === "exec.approvals.get") {
           return {
@@ -133,7 +133,7 @@ describe("guided setup recovery", () => {
     expect(result.applied).toBe(true);
     expect(result.pendingSetupsByAgentId).toEqual({});
     expect(callLog).not.toContain("agents.create");
-    expect(callLog).not.toContain("config.patch");
+    expect(callLog).toContain("config.set");
   });
 
   it("removes only the applied pending setup entry on success", async () => {
@@ -148,7 +148,7 @@ describe("guided setup recovery", () => {
             config: { agents: { list: [{ id: "agent-1" }, { id: "agent-2" }] } },
           };
         }
-        if (method === "config.patch") return { ok: true };
+        if (method === "config.set") return { ok: true };
         if (method === "agents.files.set") return { ok: true };
         if (method === "exec.approvals.get") {
           return {
@@ -185,7 +185,7 @@ describe("guided setup recovery", () => {
             config: { agents: { list: [{ id: "agent-bundle" }] } },
           };
         }
-        if (method === "config.patch") return { ok: true };
+        if (method === "config.set") return { ok: true };
         if (method === "agents.files.set") return { ok: true };
         if (method === "exec.approvals.get") {
           return {
@@ -208,6 +208,6 @@ describe("guided setup recovery", () => {
     expect(result.applied).toBe(true);
     expect(result.pendingSetupsByAgentId).toEqual({});
     expect(calls).not.toContain("agents.create");
-    expect(calls).not.toContain("config.patch");
+    expect(calls).toContain("config.set");
   });
 });

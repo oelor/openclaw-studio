@@ -61,7 +61,7 @@ describe("createAgentOperation", () => {
         if (method === "agents.create") {
           return { ok: true, agentId: "agent-1", name: "Agent 1" };
         }
-        if (method === "config.patch") {
+        if (method === "config.set") {
           const raw = (params as { raw: string }).raw;
           const parsed = JSON.parse(raw) as {
             agents?: { list?: Array<{ id: string; sandbox?: unknown; tools?: unknown }> };
@@ -165,7 +165,7 @@ describe("createAgentOperation", () => {
             config: { agents: { list: [{ id: "agent-3" }] } },
           };
         }
-        if (method === "config.patch") return { ok: true };
+        if (method === "config.set") return { ok: true };
         if (method === "agents.files.set") return { ok: true };
         if (method === "exec.approvals.get") {
           return { exists: true, hash: "ap-2", file: { version: 1, agents: {} } };
@@ -188,10 +188,10 @@ describe("createAgentOperation", () => {
       calls.lastIndexOf("exec.approvals.set")
     );
     expect(lastFilesSet).toBeGreaterThanOrEqual(0);
-    expect(calls.lastIndexOf("config.patch")).toBeGreaterThan(lastFilesSet);
+    expect(calls.lastIndexOf("config.set")).toBeGreaterThan(lastFilesSet);
   });
 
-  it("skips agent override config.patch when includeAgentOverrides is false", async () => {
+  it("skips agent override config.set when includeAgentOverrides is false", async () => {
     const setup = createSetup();
     const calls: string[] = [];
     const client = {
@@ -202,7 +202,7 @@ describe("createAgentOperation", () => {
           return { exists: true, hash: "ap-3", file: { version: 1, agents: {} } };
         }
         if (method === "exec.approvals.set") return { ok: true };
-        if (method === "config.get" || method === "config.patch") {
+        if (method === "config.get" || method === "config.set") {
           throw new Error(`unexpected method ${method}`);
         }
         throw new Error(`unexpected method ${method}`);
@@ -219,7 +219,7 @@ describe("createAgentOperation", () => {
     ).resolves.toBeUndefined();
 
     expect(calls).not.toContain("config.get");
-    expect(calls).not.toContain("config.patch");
+    expect(calls).not.toContain("config.set");
   });
 
   it("applies setup compiled from PR Engineer bundle without creating a new agent", async () => {
@@ -235,7 +235,7 @@ describe("createAgentOperation", () => {
             config: { agents: { list: [{ id: "agent-bundle" }] } },
           };
         }
-        if (method === "config.patch") return { ok: true };
+        if (method === "config.set") return { ok: true };
         if (method === "agents.files.set") return { ok: true };
         if (method === "exec.approvals.get") {
           return { exists: true, hash: "ap-bundle-1", file: { version: 1, agents: {} } };
@@ -252,6 +252,6 @@ describe("createAgentOperation", () => {
     });
 
     expect(calls).not.toContain("agents.create");
-    expect(calls).toContain("config.patch");
+    expect(calls).toContain("config.set");
   });
 });

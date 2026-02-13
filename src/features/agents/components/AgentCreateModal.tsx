@@ -192,7 +192,7 @@ const STARTER_DIRECTIONS: StarterDirectionTile[] = [
 ];
 
 type CommandMode = "off" | "ask-first" | "auto";
-type FileMode = "off" | "propose" | "apply";
+type FileMode = "off" | "on";
 type AutonomyProfileId = "conservative" | "collaborative" | "autonomous";
 
 const AUTONOMY_PROFILES: Array<{
@@ -207,7 +207,7 @@ const AUTONOMY_PROFILES: Array<{
     description: "Acts with review required.",
     details: [
       "No direct codebase writes",
-      "Proposes changes before acting",
+      "Code and files access is off by default",
       "No automatic system actions",
     ],
   },
@@ -216,7 +216,7 @@ const AUTONOMY_PROFILES: Array<{
     title: "Collaborative",
     description: "Acts with approval.",
     details: [
-      "Can propose code and file changes",
+      "Can modify code and files directly",
       "Runs system actions with approval",
       "Uses web access for context",
     ],
@@ -369,11 +369,8 @@ export const AgentCreateModal = ({
     controls: guidedDraft.controls,
     group: "group:fs",
   });
-  const fileMode: FileMode = !fileToolsEnabled
-    ? "off"
-    : guidedDraft.controls.fileEditAutonomy === "auto-edit"
-      ? "apply"
-      : "propose";
+  const fileMode: FileMode =
+    fileToolsEnabled && guidedDraft.controls.fileEditAutonomy === "auto-edit" ? "on" : "off";
   const commandMode: CommandMode = !guidedDraft.controls.allowExec
     ? "off"
     : guidedDraft.controls.execAutonomy === "auto"
@@ -411,19 +408,12 @@ export const AgentCreateModal = ({
       let controls = setGroupCapability({
         controls: current.controls,
         group: "group:fs",
-        enabled: mode !== "off",
+        enabled: mode === "on",
       });
       if (mode === "off") {
         controls = { ...controls, fileEditAutonomy: "propose-only" };
       }
-      if (mode === "propose") {
-        controls = {
-          ...controls,
-          fileEditAutonomy: "propose-only",
-          workspaceAccess: controls.workspaceAccess === "none" ? "ro" : controls.workspaceAccess,
-        };
-      }
-      if (mode === "apply") {
+      if (mode === "on") {
         controls = {
           ...controls,
           fileEditAutonomy: "auto-edit",
@@ -490,7 +480,7 @@ export const AgentCreateModal = ({
         controls = setGroupCapability({
           controls,
           group: "group:fs",
-          enabled: true,
+          enabled: false,
         });
         controls = {
           ...controls,
@@ -523,8 +513,8 @@ export const AgentCreateModal = ({
         });
         controls = {
           ...controls,
-          fileEditAutonomy: "propose-only",
-          workspaceAccess: controls.workspaceAccess === "none" ? "ro" : controls.workspaceAccess,
+          fileEditAutonomy: "auto-edit",
+          workspaceAccess: "rw",
           allowExec: true,
           execAutonomy: "ask-first",
           approvalSecurity: "allowlist",
@@ -745,7 +735,7 @@ export const AgentCreateModal = ({
                   <div className="grid gap-0.5">
                     <div className={labelClassName}>Code and Files</div>
                     <div className="text-[11px] text-muted-foreground">Controls codebase and file modification behavior.</div>
-                    <div className="grid gap-2 md:grid-cols-3">
+                    <div className="grid gap-2 md:grid-cols-2">
                       <button
                         type="button"
                         aria-label="File changes off"
@@ -756,28 +746,20 @@ export const AgentCreateModal = ({
                       </button>
                       <button
                         type="button"
-                        aria-label="File changes propose edits"
-                        className={controlOptionClassName(fileMode === "propose", "guided")}
-                        onClick={() => updateFileMode("propose")}
+                        aria-label="File changes on"
+                        className={controlOptionClassName(fileMode === "on", "full")}
+                        onClick={() => updateFileMode("on")}
                       >
-                        Propose
-                      </button>
-                      <button
-                        type="button"
-                        aria-label="File changes apply edits"
-                        className={controlOptionClassName(fileMode === "apply", "full")}
-                        onClick={() => updateFileMode("apply")}
-                      >
-                        Apply
+                        On
                       </button>
                     </div>
                     <div
                       className={`min-h-4 text-[11px] ${
-                        fileMode === "apply" ? "text-muted-foreground" : "text-transparent"
+                        fileMode === "on" ? "text-muted-foreground" : "text-transparent"
                       }`}
-                      aria-hidden={fileMode !== "apply"}
+                      aria-hidden={fileMode !== "on"}
                     >
-                      {fileMode === "apply" ? "Can modify your codebase directly." : "\u00A0"}
+                      {fileMode === "on" ? "Can modify your codebase directly." : "\u00A0"}
                     </div>
                   </div>
 

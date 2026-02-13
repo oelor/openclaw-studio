@@ -110,7 +110,7 @@ describe("AgentCreateModal", () => {
     fireEvent.click(screen.getByRole("button", { name: "Conservative autonomy profile" }));
     fireEvent.click(screen.getByRole("button", { name: "Show fine-tune capabilities" }));
     fireEvent.click(screen.getByRole("button", { name: "Web access on" }));
-    fireEvent.click(screen.getByRole("button", { name: "File changes apply edits" }));
+    fireEvent.click(screen.getByRole("button", { name: "File changes on" }));
     fireEvent.click(screen.getByRole("button", { name: "Command execution auto" }));
 
     expect(screen.getByText("Can modify your codebase directly.")).toBeInTheDocument();

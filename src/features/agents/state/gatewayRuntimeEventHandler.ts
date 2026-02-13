@@ -646,7 +646,7 @@ export function createGatewayRuntimeEventHandler(
         if (
           cleaned &&
           shouldPublishAssistantStream({
-            mergedRaw,
+            nextText: cleaned,
             rawText,
             hasChatEvents,
             currentStreamText: agent.streamText ?? null,

@@ -86,7 +86,7 @@ describe("runtime event bridge helpers", () => {
   it("suppresses assistant stream publish when chat stream already owns it", () => {
     expect(
       shouldPublishAssistantStream({
-        mergedRaw: "hello",
+        nextText: "hello",
         rawText: "",
         hasChatEvents: true,
         currentStreamText: "already streaming",
@@ -94,7 +94,7 @@ describe("runtime event bridge helpers", () => {
     ).toBe(false);
     expect(
       shouldPublishAssistantStream({
-        mergedRaw: "hello",
+        nextText: "hello",
         rawText: "",
         hasChatEvents: false,
         currentStreamText: "already streaming",
@@ -102,12 +102,20 @@ describe("runtime event bridge helpers", () => {
     ).toBe(true);
     expect(
       shouldPublishAssistantStream({
-        mergedRaw: "",
+        nextText: "",
         rawText: "",
         hasChatEvents: false,
         currentStreamText: null,
       })
     ).toBe(false);
+    expect(
+      shouldPublishAssistantStream({
+        nextText: "already streaming plus more",
+        rawText: "",
+        hasChatEvents: true,
+        currentStreamText: "already streaming",
+      })
+    ).toBe(true);
   });
 
   it("updates preview and activity from assistant chat", () => {

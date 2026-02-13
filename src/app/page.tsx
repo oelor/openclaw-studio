@@ -34,6 +34,7 @@ import {
 } from "@/features/agents/state/store";
 import {
   buildHistoryLines,
+  buildHistorySyncPatch,
   buildSummarySnapshotPatches,
   type SummaryPreviewSnapshot,
   type SummaryStatusSnapshot,
@@ -120,6 +121,7 @@ import {
   updatePendingApprovalById,
 } from "@/features/agents/approvals/pendingStore";
 import {
+  TRANSCRIPT_V2_ENABLED,
   areTranscriptEntriesEqual,
   buildOutputLinesFromTranscriptEntries,
   buildTranscriptEntriesFromLines,
@@ -1242,50 +1244,69 @@ const AgentStudioPage = () => {
           return;
         }
 
-        const existingEntries = ensureTranscriptEntriesForAgent(latest);
-        const history = buildHistoryLines(historyMessages);
-        const rawHistoryEntries = buildTranscriptEntriesFromLines({
-          lines: history.lines,
-          sessionKey,
-          source: "history",
-          startSequence: latest.transcriptSequenceCounter ?? existingEntries.length,
-          confirmed: true,
-        });
-        const historyEntries = rawHistoryEntries.map((entry) => ({
-          ...entry,
-          entryId: `history:${sessionKey}:${entry.kind}:${entry.role}:${entry.timestampMs ?? "none"}:${entry.fingerprint}`,
-        }));
-        const merged = mergeTranscriptEntriesWithHistory({
-          existingEntries,
-          historyEntries,
-        });
-        if (merged.conflictCount > 0) {
-          logTranscriptDebugMetric("transcript_merge_conflicts", {
-            agentId,
-            requestId: historyRequestId,
-            conflictCount: merged.conflictCount,
+        if (TRANSCRIPT_V2_ENABLED) {
+          const existingEntries = ensureTranscriptEntriesForAgent(latest);
+          const history = buildHistoryLines(historyMessages);
+          const rawHistoryEntries = buildTranscriptEntriesFromLines({
+            lines: history.lines,
+            sessionKey,
+            source: "history",
+            startSequence: latest.transcriptSequenceCounter ?? existingEntries.length,
+            confirmed: true,
           });
+          const historyEntries = rawHistoryEntries.map((entry) => ({
+            ...entry,
+            entryId: `history:${sessionKey}:${entry.kind}:${entry.role}:${entry.timestampMs ?? "none"}:${entry.fingerprint}`,
+          }));
+          const merged = mergeTranscriptEntriesWithHistory({
+            existingEntries,
+            historyEntries,
+          });
+          if (merged.conflictCount > 0) {
+            logTranscriptDebugMetric("transcript_merge_conflicts", {
+              agentId,
+              requestId: historyRequestId,
+              conflictCount: merged.conflictCount,
+            });
+          }
+          const mergedLines = buildOutputLinesFromTranscriptEntries(merged.entries);
+          const transcriptChanged = !areTranscriptEntriesEqual(existingEntries, merged.entries);
+          const linesChanged = !areStringArraysEqual(latest.outputLines, mergedLines);
+          dispatch({
+            type: "updateAgent",
+            agentId,
+            patch: {
+              ...metadataPatch,
+              ...(transcriptChanged || linesChanged
+                ? {
+                    transcriptEntries: merged.entries,
+                    outputLines: mergedLines,
+                  }
+                : {}),
+              ...(history.lastAssistant ? { lastResult: history.lastAssistant } : {}),
+              ...(history.lastAssistant ? { latestPreview: history.lastAssistant } : {}),
+              ...(typeof history.lastAssistantAt === "number"
+                ? { lastAssistantMessageAt: history.lastAssistantAt }
+                : {}),
+              ...(history.lastUser ? { lastUserMessage: history.lastUser } : {}),
+            },
+          });
+          return;
         }
-        const mergedLines = buildOutputLinesFromTranscriptEntries(merged.entries);
-        const transcriptChanged = !areTranscriptEntriesEqual(existingEntries, merged.entries);
-        const linesChanged = !areStringArraysEqual(latest.outputLines, mergedLines);
+
+        const patch = buildHistorySyncPatch({
+          messages: historyMessages,
+          currentLines: latest.outputLines,
+          loadedAt,
+          status: latest.status,
+          runId: latest.runId,
+        });
         dispatch({
           type: "updateAgent",
           agentId,
           patch: {
+            ...patch,
             ...metadataPatch,
-            ...(transcriptChanged || linesChanged
-              ? {
-                  transcriptEntries: merged.entries,
-                  outputLines: mergedLines,
-                }
-              : {}),
-            ...(history.lastAssistant ? { lastResult: history.lastAssistant } : {}),
-            ...(history.lastAssistant ? { latestPreview: history.lastAssistant } : {}),
-            ...(typeof history.lastAssistantAt === "number"
-              ? { lastAssistantMessageAt: history.lastAssistantAt }
-              : {}),
-            ...(history.lastUser ? { lastUserMessage: history.lastUser } : {}),
           },
         });
       } catch (err) {
@@ -1731,7 +1752,6 @@ const AgentStudioPage = () => {
                   client,
                   agentId: created.id,
                   setup,
-                  includeAgentOverrides: false,
                 });
                 setPendingCreateSetupsByAgentId((current) =>
                   removePendingGuidedSetup(current, created.id)
@@ -1770,7 +1790,6 @@ const AgentStudioPage = () => {
                 client,
                 agentId: created.id,
                 setup,
-                includeAgentOverrides: false,
               });
               setPendingCreateSetupsByAgentId((current) =>
                 removePendingGuidedSetup(current, created.id)

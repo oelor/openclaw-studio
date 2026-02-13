@@ -11,6 +11,10 @@ const readBooleanFlag = (value: string | undefined): boolean => {
   return ENABLED_RE.test((value ?? "").trim());
 };
 
+export const TRANSCRIPT_V2_ENABLED = readBooleanFlag(
+  process.env.NEXT_PUBLIC_STUDIO_TRANSCRIPT_V2
+);
+
 export const TRANSCRIPT_DEBUG_ENABLED = readBooleanFlag(
   process.env.NEXT_PUBLIC_STUDIO_TRANSCRIPT_DEBUG
 );
@@ -194,8 +198,8 @@ const compareEntries = (a: TranscriptEntry, b: TranscriptEntry): number => {
   const aHasTs = hasNumericTimestamp(a.timestampMs);
   const bHasTs = hasNumericTimestamp(b.timestampMs);
   if (aHasTs && bHasTs) {
-    const aTimestamp = a.timestampMs as number;
-    const bTimestamp = b.timestampMs as number;
+    const aTimestamp = a.timestampMs;
+    const bTimestamp = b.timestampMs;
     if (aTimestamp !== bTimestamp) {
       return aTimestamp - bTimestamp;
     }

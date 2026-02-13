@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 
+import { GatewayResponseError } from "@/lib/gateway/GatewayClient";
 import type { GatewayClient } from "@/lib/gateway/GatewayClient";
 import { updateGatewayAgentOverrides } from "@/lib/gateway/agentConfig";
 
@@ -18,7 +19,7 @@ describe("updateGatewayAgentOverrides", () => {
             },
           };
         }
-        if (method === "config.patch") {
+        if (method === "config.set") {
           const raw = (params as { raw?: string }).raw ?? "";
           const parsed = JSON.parse(raw) as {
             agents?: { list?: Array<{ id?: string; tools?: { profile?: string; alsoAllow?: string[]; deny?: string[] } }> };
@@ -62,7 +63,7 @@ describe("updateGatewayAgentOverrides", () => {
             },
           };
         }
-        if (method === "config.patch") {
+        if (method === "config.set") {
           const raw = (params as { raw?: string }).raw ?? "";
           const parsed = JSON.parse(raw) as {
             agents?: {
@@ -101,7 +102,7 @@ describe("updateGatewayAgentOverrides", () => {
     });
   });
 
-  it("patches only agent list when snapshot has redacted non-agent fields", async () => {
+  it("preserves redacted non-agent fields when writing full config", async () => {
     const client = {
       call: vi.fn(async (method: string, params?: unknown) => {
         if (method === "config.get") {
@@ -122,10 +123,16 @@ describe("updateGatewayAgentOverrides", () => {
             },
           };
         }
-        if (method === "config.patch") {
+        if (method === "config.set") {
           const raw = (params as { raw?: string }).raw ?? "";
           const parsed = JSON.parse(raw) as Record<string, unknown>;
-          expect(parsed.models).toBeUndefined();
+          expect(parsed.models).toEqual({
+            providers: {
+              xai: {
+                models: [{ id: "grok", maxTokens: "__OPENCLAW_REDACTED__" }],
+              },
+            },
+          });
           expect(parsed.agents).toEqual({
             list: [
               {
@@ -153,6 +160,54 @@ describe("updateGatewayAgentOverrides", () => {
         },
       },
     });
+  });
+
+  it("retries config.set once when the config hash is stale", async () => {
+    let configGetCount = 0;
+    let configSetCount = 0;
+    const client = {
+      call: vi.fn(async (method: string, params?: unknown) => {
+        if (method === "config.get") {
+          configGetCount += 1;
+          return {
+            exists: true,
+            hash: configGetCount === 1 ? "cfg-retry-1" : "cfg-retry-2",
+            config: {
+              agents: {
+                list: [{ id: "agent-1" }],
+              },
+            },
+          };
+        }
+        if (method === "config.set") {
+          configSetCount += 1;
+          if (configSetCount === 1) {
+            throw new GatewayResponseError({
+              code: "INVALID_REQUEST",
+              message: "config changed since last load; re-run config.get and retry",
+            });
+          }
+          const payload = params as { baseHash?: string };
+          expect(payload.baseHash).toBe("cfg-retry-2");
+          return { ok: true };
+        }
+        throw new Error(`unexpected method ${method}`);
+      }),
+    } as unknown as GatewayClient;
+
+    await updateGatewayAgentOverrides({
+      client,
+      agentId: "agent-1",
+      overrides: {
+        tools: {
+          profile: "coding",
+          alsoAllow: ["group:web"],
+        },
+      },
+    });
+
+    expect(configGetCount).toBe(2);
+    expect(configSetCount).toBe(2);
   });
 
   it("fails fast when both allow and alsoAllow are provided", async () => {

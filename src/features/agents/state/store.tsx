@@ -14,6 +14,7 @@ import {
   buildTranscriptEntriesFromLines,
   createTranscriptEntryFromLine,
   sortTranscriptEntries,
+  TRANSCRIPT_V2_ENABLED,
   type TranscriptAppendMeta,
   type TranscriptEntry,
 } from "@/features/agents/state/transcript";
@@ -265,7 +266,9 @@ const reducer = (state: AgentStoreState, action: Action): AgentStoreState => {
           let transcriptMutated = false;
 
           if (Array.isArray(patch.transcriptEntries)) {
-            const normalized = sortTranscriptEntries(patch.transcriptEntries);
+            const normalized = TRANSCRIPT_V2_ENABLED
+              ? sortTranscriptEntries(patch.transcriptEntries)
+              : [...patch.transcriptEntries];
             transcriptMutated = !areTranscriptEntriesEqual(existingEntries, normalized);
             nextEntries = normalized;
             nextOutputLines = buildOutputLinesFromTranscriptEntries(normalized);
@@ -277,10 +280,12 @@ const reducer = (state: AgentStoreState, action: Action): AgentStoreState => {
               startSequence: 0,
               confirmed: true,
             });
-            const normalized = sortTranscriptEntries(rebuilt);
+            const normalized = TRANSCRIPT_V2_ENABLED ? sortTranscriptEntries(rebuilt) : rebuilt;
             transcriptMutated = !areStringArraysEqual(agent.outputLines, patch.outputLines);
             nextEntries = normalized;
-            nextOutputLines = buildOutputLinesFromTranscriptEntries(normalized);
+            nextOutputLines = TRANSCRIPT_V2_ENABLED
+              ? buildOutputLinesFromTranscriptEntries(normalized)
+              : [...patch.outputLines];
           }
 
           const revision = transcriptMutated
@@ -333,10 +338,12 @@ const reducer = (state: AgentStoreState, action: Action): AgentStoreState => {
             return { ...agent, outputLines: [...agent.outputLines, action.line] };
           }
           const appended = [...existingEntries, nextEntry];
-          const nextEntries = sortTranscriptEntries(appended);
+          const nextEntries = TRANSCRIPT_V2_ENABLED ? sortTranscriptEntries(appended) : appended;
           return {
             ...agent,
-            outputLines: buildOutputLinesFromTranscriptEntries(nextEntries),
+            outputLines: TRANSCRIPT_V2_ENABLED
+              ? buildOutputLinesFromTranscriptEntries(nextEntries)
+              : [...agent.outputLines, action.line],
             transcriptEntries: nextEntries,
             transcriptRevision: (agent.transcriptRevision ?? 0) + 1,
             transcriptSequenceCounter: Math.max(

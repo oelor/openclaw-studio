@@ -164,6 +164,77 @@ describe("gateway runtime event handler (agent)", () => {
     expect("streamText" in patch).toBe(false);
   });
 
+  it("allows assistant stream extension when chat stream stalls", () => {
+    const agents = [
+      createAgent({
+        status: "running",
+        runId: "run-2",
+        runStartedAt: 900,
+        streamText: "hello",
+      }),
+    ];
+    const queueLivePatch = vi.fn();
+    const handler = createGatewayRuntimeEventHandler({
+      getStatus: () => "connected",
+      getAgents: () => agents,
+      dispatch: vi.fn(),
+      queueLivePatch,
+      clearPendingLivePatch: vi.fn(),
+      now: () => 1000,
+      loadSummarySnapshot: vi.fn(async () => {}),
+      loadAgentHistory: vi.fn(async () => {}),
+      refreshHeartbeatLatestUpdate: vi.fn(),
+      bumpHeartbeatTick: vi.fn(),
+      setTimeout: (fn, ms) => setTimeout(fn, ms) as unknown as number,
+      clearTimeout: (id) => clearTimeout(id as unknown as NodeJS.Timeout),
+      isDisconnectLikeError: () => false,
+      logWarn: vi.fn(),
+      updateSpecialLatestUpdate: vi.fn(),
+    });
+
+    handler.handleEvent({
+      type: "event",
+      event: "chat",
+      payload: {
+        runId: "run-2",
+        sessionKey: agents[0]!.sessionKey,
+        state: "delta",
+        message: { role: "user", content: "hi" },
+      },
+    });
+
+    handler.handleEvent({
+      type: "event",
+      event: "agent",
+      payload: {
+        runId: "run-2",
+        sessionKey: agents[0]!.sessionKey,
+        stream: "assistant",
+        data: { delta: "hello" },
+      },
+    } as EventFrame);
+
+    handler.handleEvent({
+      type: "event",
+      event: "agent",
+      payload: {
+        runId: "run-2",
+        sessionKey: agents[0]!.sessionKey,
+        stream: "assistant",
+        data: { delta: " world" },
+      },
+    } as EventFrame);
+
+    const lastCall = queueLivePatch.mock.calls[queueLivePatch.mock.calls.length - 1] as
+      | [string, Partial<AgentState>]
+      | undefined;
+    if (!lastCall) throw new Error("Expected queueLivePatch to be called");
+    const patch = lastCall[1];
+    expect(patch.status).toBe("running");
+    expect(patch.runId).toBe("run-2");
+    expect(patch.streamText).toBe("hello world");
+  });
+
   it("formats and dedupes tool call lines per run", () => {
     const agents = [createAgent({ status: "running", runId: "run-3", runStartedAt: 900 })];
     const actions: Array<{ type: string; line?: string }> = [];
