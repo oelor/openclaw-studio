@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AgentChatPanel } from "@/features/agents/components/AgentChatPanel";
+import { AgentCreateModal } from "@/features/agents/components/AgentCreateModal";
 import {
   AgentBrainPanel,
   AgentSettingsPanel,
@@ -9,13 +10,15 @@ import {
 import { FleetSidebar } from "@/features/agents/components/FleetSidebar";
 import { HeaderBar } from "@/features/agents/components/HeaderBar";
 import { ConnectionPanel } from "@/features/agents/components/ConnectionPanel";
+import { GatewayConnectScreen } from "@/features/agents/components/GatewayConnectScreen";
 import { EmptyStatePanel } from "@/features/agents/components/EmptyStatePanel";
 import {
-  extractText,
+  EXEC_APPROVAL_AUTO_RESUME_MARKER,
   isHeartbeatPrompt,
-  stripUiMetadata,
 } from "@/lib/text/message-extract";
-import { useGatewayConnection } from "@/lib/gateway/GatewayClient";
+import {
+  useGatewayConnection,
+} from "@/lib/gateway/GatewayClient";
 import { createRafBatcher } from "@/lib/dom";
 import {
   buildGatewayModelChoices,
@@ -31,13 +34,13 @@ import {
   useAgentStore,
 } from "@/features/agents/state/store";
 import {
-  buildHistorySyncPatch,
   buildSummarySnapshotPatches,
   type SummaryPreviewSnapshot,
   type SummaryStatusSnapshot,
 } from "@/features/agents/state/runtimeEventBridge";
 import type { AgentState } from "@/features/agents/state/store";
 import { createGatewayRuntimeEventHandler } from "@/features/agents/state/gatewayRuntimeEventHandler";
+import { mergePendingLivePatch } from "@/features/agents/state/livePatchQueue";
 import {
   type CronJobSummary,
   filterCronJobsForAgent,
@@ -46,54 +49,96 @@ import {
   removeCronJob,
   resolveLatestCronJobForAgent,
   runCronJobNow,
+  sortCronJobsByUpdatedAt,
 } from "@/lib/cron/types";
+import type { CronCreateDraft } from "@/lib/cron/createPayloadBuilder";
 import {
   createGatewayAgent,
   renameGatewayAgent,
   removeGatewayHeartbeatOverride,
   listHeartbeatsForAgent,
+  readConfigAgentList,
+  slugifyAgentName,
   triggerHeartbeatNow,
+  updateGatewayAgentOverrides,
   type AgentHeartbeatSummary,
 } from "@/lib/gateway/agentConfig";
 import { buildAvatarDataUrl } from "@/lib/avatars/multiavatar";
 import { createStudioSettingsCoordinator } from "@/lib/studio/coordinator";
 import { resolveFocusedPreference } from "@/lib/studio/settings";
 import { applySessionSettingMutation } from "@/features/agents/state/sessionSettingsMutations";
+import type { AgentCreateModalSubmitPayload } from "@/features/agents/creation/types";
 import {
-  parseAgentIdFromSessionKey,
   isGatewayDisconnectLikeError,
   type EventFrame,
 } from "@/lib/gateway/GatewayClient";
 import { fetchJson } from "@/lib/http";
-import { bootstrapAgentBrainFilesFromTemplate } from "@/lib/gateway/agentFiles";
 import { deleteAgentViaStudio } from "@/features/agents/operations/deleteAgentOperation";
+import { performCronCreateFlow } from "@/features/agents/operations/cronCreateOperation";
 import { sendChatMessageViaStudio } from "@/features/agents/operations/chatSendOperation";
 import { hydrateAgentFleetFromGateway } from "@/features/agents/operations/agentFleetHydration";
+import { resolveConfigMutationStatusLine } from "@/features/agents/operations/configMutationWorkflow";
 import { useConfigMutationQueue } from "@/features/agents/operations/useConfigMutationQueue";
+import { isLocalGatewayUrl } from "@/lib/gateway/local-gateway";
+import { shouldAwaitDisconnectRestartForRemoteMutation } from "@/lib/gateway/gatewayReloadMode";
 import { useGatewayRestartBlock } from "@/features/agents/operations/useGatewayRestartBlock";
+import { randomUUID } from "@/lib/uuid";
+import type { ExecApprovalDecision, PendingExecApproval } from "@/features/agents/approvals/types";
+import {
+  resolveGatewayEventIngressDecision,
+} from "@/features/agents/state/gatewayEventIngressWorkflow";
+import { resolveExecApprovalViaStudio } from "@/features/agents/approvals/execApprovalResolveOperation";
+import {
+  mergePendingApprovalsForFocusedAgent,
+  nextPendingApprovalPruneDelayMs,
+  pruneExpiredPendingApprovals,
+  pruneExpiredPendingApprovalsMap,
+  removePendingApprovalById,
+  removePendingApprovalEverywhere,
+  removePendingApprovalByIdMap,
+  upsertPendingApproval,
+} from "@/features/agents/approvals/pendingStore";
+import { shouldPauseRunForPendingExecApproval } from "@/features/agents/approvals/execApprovalPausePolicy";
+import {
+  TRANSCRIPT_V2_ENABLED,
+  logTranscriptDebugMetric,
+} from "@/features/agents/state/transcript";
+import {
+  resolveLatestUpdateKind,
+} from "@/features/agents/operations/latestUpdateWorkflow";
+import { createSpecialLatestUpdateOperation } from "@/features/agents/operations/specialLatestUpdateOperation";
+import {
+  updateExecutionRoleViaStudio,
+} from "@/features/agents/operations/executionRoleUpdateOperation";
+import {
+  updateAgentPermissionsViaStudio,
+  resolveAgentPermissionsDraft,
+  type AgentPermissionsDraft,
+} from "@/features/agents/operations/agentPermissionsOperation";
+import {
+  resolveSummarySnapshotIntent,
+} from "@/features/agents/operations/fleetLifecycleWorkflow";
+import {
+  executeAgentReconcileCommands,
+  runAgentReconcileOperation,
+} from "@/features/agents/operations/agentReconcileOperation";
+import {
+  executeHistorySyncCommands,
+  runHistorySyncOperation,
+} from "@/features/agents/operations/historySyncOperation";
+import {
+  buildQueuedMutationBlock,
+  resolveMutationStartGuard,
+} from "@/features/agents/operations/agentMutationLifecycleController";
+import { runAgentConfigMutationLifecycle } from "@/features/agents/operations/agentConfigMutationLifecycleOperation";
+import {
+  isCreateBlockTimedOut,
+  runCreateAgentMutationLifecycle,
+} from "@/features/agents/operations/createAgentMutationLifecycleOperation";
 
-type ChatHistoryMessage = Record<string, unknown>;
-
-type ChatHistoryResult = {
-  sessionKey: string;
-  sessionId?: string;
-  messages: ChatHistoryMessage[];
-  thinkingLevel?: string;
-};
-
-type SessionsListEntry = {
-  key: string;
-  updatedAt?: number | null;
-  displayName?: string;
-  origin?: { label?: string | null; provider?: string | null } | null;
-  thinkingLevel?: string;
-  modelProvider?: string;
-  model?: string;
-};
-
-type SessionsListResult = {
-  sessions?: SessionsListEntry[];
-};
+const DEFAULT_CHAT_HISTORY_LIMIT = 200;
+const MAX_CHAT_HISTORY_LIMIT = 5000;
+const PENDING_EXEC_APPROVAL_PRUNE_GRACE_MS = 500;
 
 type MobilePane = "fleet" | "chat" | "settings" | "brain";
 type DeleteAgentBlockPhase = "queued" | "deleting" | "awaiting-restart";
@@ -104,13 +149,11 @@ type DeleteAgentBlockState = {
   startedAt: number;
   sawDisconnect: boolean;
 };
-type CreateAgentBlockPhase = "queued" | "creating" | "awaiting-restart" | "bootstrapping-files";
+type CreateAgentBlockPhase = "queued" | "creating";
 type CreateAgentBlockState = {
-  agentId: string | null;
   agentName: string;
   phase: CreateAgentBlockPhase;
   startedAt: number;
-  sawDisconnect: boolean;
 };
 type RenameAgentBlockPhase = "queued" | "renaming" | "awaiting-restart";
 type RenameAgentBlockState = {
@@ -122,52 +165,24 @@ type RenameAgentBlockState = {
 };
 
 const RESERVED_MAIN_AGENT_ID = "main";
-const SPECIAL_UPDATE_HEARTBEAT_RE = /\bheartbeat\b/i;
-const SPECIAL_UPDATE_CRON_RE = /\bcron\b/i;
-
-const resolveSpecialUpdateKind = (message: string) => {
-  const lowered = message.toLowerCase();
-  const heartbeatIndex = lowered.search(SPECIAL_UPDATE_HEARTBEAT_RE);
-  const cronIndex = lowered.search(SPECIAL_UPDATE_CRON_RE);
-  if (heartbeatIndex === -1 && cronIndex === -1) return null;
-  if (heartbeatIndex === -1) return "cron";
-  if (cronIndex === -1) return "heartbeat";
-  return cronIndex > heartbeatIndex ? "cron" : "heartbeat";
-};
-
-const sortCronJobsByUpdatedAt = (jobs: CronJobSummary[]) =>
-  [...jobs].sort((a, b) => b.updatedAtMs - a.updatedAtMs);
-
-const findLatestHeartbeatResponse = (messages: ChatHistoryMessage[]) => {
-  let awaitingHeartbeatReply = false;
-  let latestResponse: string | null = null;
-  for (const message of messages) {
-    const role = typeof message.role === "string" ? message.role : "";
-    if (role === "user") {
-      const text = stripUiMetadata(extractText(message) ?? "").trim();
-      awaitingHeartbeatReply = isHeartbeatPrompt(text);
-      continue;
-    }
-    if (role === "assistant" && awaitingHeartbeatReply) {
-      const text = stripUiMetadata(extractText(message) ?? "").trim();
-      if (text) {
-        latestResponse = text;
-      }
-    }
-  }
-  return latestResponse;
-};
 
 const resolveNextNewAgentName = (agents: AgentState[]) => {
   const baseName = "New Agent";
-  const existing = new Set(
+  const existingNames = new Set(
     agents.map((agent) => agent.name.trim().toLowerCase()).filter((name) => name.length > 0)
   );
+  const existingIds = new Set(
+    agents
+      .map((agent) => agent.agentId.trim().toLowerCase())
+      .filter((agentId) => agentId.length > 0)
+  );
   const baseLower = baseName.toLowerCase();
-  if (!existing.has(baseLower)) return baseName;
+  if (!existingNames.has(baseLower) && !existingIds.has(slugifyAgentName(baseName))) return baseName;
   for (let index = 2; index < 10000; index += 1) {
     const candidate = `${baseName} ${index}`;
-    if (!existing.has(candidate.toLowerCase())) return candidate;
+    if (existingNames.has(candidate.toLowerCase())) continue;
+    if (existingIds.has(slugifyAgentName(candidate))) continue;
+    return candidate;
   }
   throw new Error("Unable to allocate a unique agent name.");
 };
@@ -179,9 +194,11 @@ const AgentStudioPage = () => {
     status,
     gatewayUrl,
     token,
+    localGatewayDefaults,
     error: gatewayError,
     connect,
     disconnect,
+    useLocalGatewayDefaults,
     setGatewayUrl,
     setToken,
   } = useGatewayConnection(settingsCoordinator);
@@ -191,6 +208,7 @@ const AgentStudioPage = () => {
   const [focusFilter, setFocusFilter] = useState<FocusFilter>("all");
   const [focusedPreferencesLoaded, setFocusedPreferencesLoaded] = useState(false);
   const [agentsLoadedOnce, setAgentsLoadedOnce] = useState(false);
+  const [didAttemptGatewayConnect, setDidAttemptGatewayConnect] = useState(false);
   const [heartbeatTick, setHeartbeatTick] = useState(0);
   const historyInFlightRef = useRef<Set<string>>(new Set());
   const stateRef = useRef(state);
@@ -200,12 +218,15 @@ const AgentStudioPage = () => {
   const [gatewayConfigSnapshot, setGatewayConfigSnapshot] =
     useState<GatewayModelPolicySnapshot | null>(null);
   const [createAgentBusy, setCreateAgentBusy] = useState(false);
+  const [createAgentModalOpen, setCreateAgentModalOpen] = useState(false);
+  const [createAgentModalError, setCreateAgentModalError] = useState<string | null>(null);
   const [stopBusyAgentId, setStopBusyAgentId] = useState<string | null>(null);
   const [mobilePane, setMobilePane] = useState<MobilePane>("chat");
   const [settingsAgentId, setSettingsAgentId] = useState<string | null>(null);
   const [settingsCronJobs, setSettingsCronJobs] = useState<CronJobSummary[]>([]);
   const [settingsCronLoading, setSettingsCronLoading] = useState(false);
   const [settingsCronError, setSettingsCronError] = useState<string | null>(null);
+  const [cronCreateBusy, setCronCreateBusy] = useState(false);
   const [cronRunBusyJobId, setCronRunBusyJobId] = useState<string | null>(null);
   const [cronDeleteBusyJobId, setCronDeleteBusyJobId] = useState<string | null>(null);
   const [settingsHeartbeats, setSettingsHeartbeats] = useState<AgentHeartbeatSummary[]>([]);
@@ -217,8 +238,15 @@ const AgentStudioPage = () => {
   const [deleteAgentBlock, setDeleteAgentBlock] = useState<DeleteAgentBlockState | null>(null);
   const [createAgentBlock, setCreateAgentBlock] = useState<CreateAgentBlockState | null>(null);
   const [renameAgentBlock, setRenameAgentBlock] = useState<RenameAgentBlockState | null>(null);
+  const [pendingExecApprovalsByAgentId, setPendingExecApprovalsByAgentId] = useState<
+    Record<string, PendingExecApproval[]>
+  >({});
+  const [unscopedPendingExecApprovals, setUnscopedPendingExecApprovals] = useState<
+    PendingExecApproval[]
+  >([]);
   const specialUpdateRef = useRef<Map<string, string>>(new Map());
-  const specialUpdateInFlightRef = useRef<Set<string>>(new Set());
+  const seenCronEventIdsRef = useRef<Set<string>>(new Set());
+  const preferredSelectedAgentIdRef = useRef<string | null>(null);
   const pendingDraftValuesRef = useRef<Map<string, string>>(new Map());
   const pendingDraftTimersRef = useRef<Map<string, number>>(new Map());
   const pendingLivePatchesRef = useRef<Map<string, Partial<AgentState>>>(new Map());
@@ -227,6 +255,8 @@ const AgentStudioPage = () => {
   const runtimeEventHandlerRef = useRef<ReturnType<typeof createGatewayRuntimeEventHandler> | null>(
     null
   );
+  const reconcileRunInFlightRef = useRef<Set<string>>(new Set());
+  const approvalPausedRunIdByAgentRef = useRef<Map<string, string>>(new Map());
 
   const agents = state.agents;
   const selectedAgent = useMemo(() => getSelectedAgent(state), [state]);
@@ -243,13 +273,58 @@ const AgentStudioPage = () => {
   }, [filteredAgents, selectedAgent]);
   const focusedAgentId = focusedAgent?.agentId ?? null;
   const focusedAgentRunning = focusedAgent?.status === "running";
+  const focusedAgentStopDisabledReason = useMemo(() => {
+    if (!focusedAgent) return null;
+    if (focusedAgent.status !== "running") return null;
+    const lastMessage = focusedAgent.lastUserMessage?.trim() ?? "";
+    if (!lastMessage || !isHeartbeatPrompt(lastMessage)) return null;
+    return "This task is running as an automatic heartbeat check. Stopping heartbeat runs from Studio isn't available yet (coming soon).";
+  }, [focusedAgent]);
   const settingsAgent = useMemo(() => {
     if (!settingsAgentId) return null;
     return agents.find((entry) => entry.agentId === settingsAgentId) ?? null;
   }, [agents, settingsAgentId]);
+  const settingsAgentPermissionsDraft = useMemo(() => {
+    if (!settingsAgent) return null;
+    const baseConfig =
+      gatewayConfigSnapshot?.config &&
+      typeof gatewayConfigSnapshot.config === "object" &&
+      !Array.isArray(gatewayConfigSnapshot.config)
+        ? (gatewayConfigSnapshot.config as Record<string, unknown>)
+        : undefined;
+    const list = readConfigAgentList(baseConfig);
+    const configEntry = list.find((entry) => entry.id === settingsAgent.agentId) ?? null;
+    const toolsRaw =
+      configEntry && typeof (configEntry as Record<string, unknown>).tools === "object"
+        ? ((configEntry as Record<string, unknown>).tools as unknown)
+        : null;
+    const tools =
+      toolsRaw && typeof toolsRaw === "object" && !Array.isArray(toolsRaw)
+        ? (toolsRaw as Record<string, unknown>)
+        : null;
+    return resolveAgentPermissionsDraft({
+      agent: settingsAgent,
+      existingTools: tools,
+    });
+  }, [gatewayConfigSnapshot, settingsAgent]);
   const selectedBrainAgentId = useMemo(() => {
     return focusedAgent?.agentId ?? agents[0]?.agentId ?? null;
   }, [agents, focusedAgent]);
+  const focusedPendingExecApprovals = useMemo(() => {
+    if (!focusedAgentId) return unscopedPendingExecApprovals;
+    const scoped = pendingExecApprovalsByAgentId[focusedAgentId] ?? [];
+    return mergePendingApprovalsForFocusedAgent({
+      scopedApprovals: scoped,
+      unscopedApprovals: unscopedPendingExecApprovals,
+    });
+  }, [focusedAgentId, pendingExecApprovalsByAgentId, unscopedPendingExecApprovals]);
+  const suggestedCreateAgentName = useMemo(() => {
+    try {
+      return resolveNextNewAgentName(state.agents);
+    } catch {
+      return "New Agent";
+    }
+  }, [state.agents]);
   const faviconSeed = useMemo(() => {
     const firstAgent = agents[0];
     const seed = firstAgent?.avatarSeed ?? firstAgent?.agentId ?? "";
@@ -265,6 +340,7 @@ const AgentStudioPage = () => {
     [agents]
   );
   const hasRunningAgents = runningAgentCount > 0;
+  const isLocalGateway = useMemo(() => isLocalGatewayUrl(gatewayUrl), [gatewayUrl]);
 
   const hasRestartBlockInProgress = Boolean(
     (deleteAgentBlock && deleteAgentBlock.phase !== "queued") ||
@@ -347,8 +423,19 @@ const AgentStudioPage = () => {
     const key = agentId.trim();
     if (!key) return;
     const existing = pendingLivePatchesRef.current.get(key);
-    pendingLivePatchesRef.current.set(key, existing ? { ...existing, ...patch } : patch);
+    pendingLivePatchesRef.current.set(key, mergePendingLivePatch(existing, patch));
     livePatchBatcherRef.current.schedule();
+  }, []);
+
+  const clearPendingLivePatch = useCallback((agentId: string) => {
+    const key = agentId.trim();
+    if (!key) return;
+    const pending = pendingLivePatchesRef.current;
+    if (!pending.has(key)) return;
+    pending.delete(key);
+    if (pending.size === 0) {
+      livePatchBatcherRef.current.cancel();
+    }
   }, []);
 
   useEffect(() => {
@@ -373,9 +460,23 @@ const AgentStudioPage = () => {
   }, [faviconHref]);
 
 
-  const resolveCronJobForAgent = useCallback((jobs: CronJobSummary[], agent: AgentState) => {
-    return resolveLatestCronJobForAgent(jobs, agent.agentId);
+  const resolveCronJobForAgent = useCallback((jobs: CronJobSummary[], agentId: string) => {
+    return resolveLatestCronJobForAgent(jobs, agentId);
   }, []);
+
+  const specialLatestUpdate = useMemo(() => {
+    return createSpecialLatestUpdateOperation({
+      callGateway: (method, params) => client.call(method, params),
+      listCronJobs: () => listCronJobs(client, { includeDisabled: true }),
+      resolveCronJobForAgent,
+      formatCronJobDisplay,
+      dispatchUpdateAgent: (agentId, patch) => {
+        dispatch({ type: "updateAgent", agentId, patch });
+      },
+      isDisconnectLikeError: isGatewayDisconnectLikeError,
+      logError: (message) => console.error(message),
+    });
+  }, [client, dispatch, resolveCronJobForAgent]);
 
   const loadCronJobsForSettingsAgent = useCallback(
     async (agentId: string) => {
@@ -432,103 +533,10 @@ const AgentStudioPage = () => {
     [client]
   );
 
-  const updateSpecialLatestUpdate = useCallback(
-    async (agentId: string, agent: AgentState, message: string) => {
-      const key = agentId;
-      const kind = resolveSpecialUpdateKind(message);
-      if (!kind) {
-        if (agent.latestOverride || agent.latestOverrideKind) {
-          dispatch({
-            type: "updateAgent",
-            agentId: agent.agentId,
-            patch: { latestOverride: null, latestOverrideKind: null },
-          });
-        }
-        return;
-      }
-      if (specialUpdateInFlightRef.current.has(key)) return;
-      specialUpdateInFlightRef.current.add(key);
-      try {
-        if (kind === "heartbeat") {
-          const resolvedId =
-            agent.agentId?.trim() || parseAgentIdFromSessionKey(agent.sessionKey);
-          if (!resolvedId) {
-            dispatch({
-              type: "updateAgent",
-              agentId: agent.agentId,
-              patch: { latestOverride: null, latestOverrideKind: null },
-            });
-            return;
-          }
-          const sessions = await client.call<SessionsListResult>("sessions.list", {
-            agentId: resolvedId,
-            includeGlobal: false,
-            includeUnknown: false,
-            limit: 48,
-          });
-          const entries = Array.isArray(sessions.sessions) ? sessions.sessions : [];
-          const heartbeatSessions = entries.filter((entry) => {
-            const label = entry.origin?.label;
-            return typeof label === "string" && label.toLowerCase() === "heartbeat";
-          });
-          const candidates = heartbeatSessions.length > 0 ? heartbeatSessions : entries;
-          const sorted = [...candidates].sort(
-            (a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0)
-          );
-          const sessionKey = sorted[0]?.key;
-          if (!sessionKey) {
-            dispatch({
-              type: "updateAgent",
-              agentId: agent.agentId,
-              patch: { latestOverride: null, latestOverrideKind: null },
-            });
-            return;
-          }
-          const history = await client.call<ChatHistoryResult>("chat.history", {
-            sessionKey,
-            limit: 200,
-          });
-          const content = findLatestHeartbeatResponse(history.messages ?? []) ?? "";
-          dispatch({
-            type: "updateAgent",
-            agentId: agent.agentId,
-            patch: {
-              latestOverride: content || null,
-              latestOverrideKind: content ? "heartbeat" : null,
-            },
-          });
-          return;
-        }
-        const cronResult = await listCronJobs(client, { includeDisabled: true });
-        const job = resolveCronJobForAgent(cronResult.jobs, agent);
-        const content = job ? formatCronJobDisplay(job) : "";
-        dispatch({
-          type: "updateAgent",
-          agentId: agent.agentId,
-          patch: {
-            latestOverride: content || null,
-            latestOverrideKind: content ? "cron" : null,
-          },
-        });
-      } catch (err) {
-        if (!isGatewayDisconnectLikeError(err)) {
-          const message =
-            err instanceof Error ? err.message : "Failed to load latest cron/heartbeat update.";
-          console.error(message);
-        }
-      } finally {
-        specialUpdateInFlightRef.current.delete(key);
-      }
-    },
-    [client, dispatch, resolveCronJobForAgent]
-  );
-
   const refreshHeartbeatLatestUpdate = useCallback(() => {
     const agents = stateRef.current.agents;
-    for (const agent of agents) {
-      void updateSpecialLatestUpdate(agent.agentId, agent, "heartbeat");
-    }
-  }, [updateSpecialLatestUpdate]);
+    specialLatestUpdate.refreshHeartbeat(agents);
+  }, [specialLatestUpdate]);
 
   const loadAgents = useCallback(async () => {
     if (status !== "connected") return;
@@ -545,12 +553,26 @@ const AgentStudioPage = () => {
       if (!gatewayConfigSnapshot && result.configSnapshot) {
         setGatewayConfigSnapshot(result.configSnapshot);
       }
-      hydrateAgents(result.seeds);
+      const preferredSelectedAgentId = preferredSelectedAgentIdRef.current?.trim() ?? "";
+      const hasCurrentSelection = Boolean(stateRef.current.selectedAgentId);
+      const preferredSelectedAgentExists =
+        preferredSelectedAgentId.length > 0 &&
+        result.seeds.some((seed) => seed.agentId === preferredSelectedAgentId);
+      const initialSelectedAgentId = hasCurrentSelection
+        ? undefined
+        : preferredSelectedAgentExists
+          ? preferredSelectedAgentId
+          : result.suggestedSelectedAgentId ?? undefined;
+      hydrateAgents(result.seeds, initialSelectedAgentId);
+      const sessionSettingsSyncedAgentIds = new Set(result.sessionSettingsSyncedAgentIds);
       for (const agentId of result.sessionCreatedAgentIds) {
         dispatch({
           type: "updateAgent",
           agentId,
-          patch: { sessionCreated: true, sessionSettingsSynced: true },
+          patch: {
+            sessionCreated: true,
+            sessionSettingsSynced: sessionSettingsSyncedAgentIds.has(agentId),
+          },
         });
       }
       for (const entry of result.summaryPatches) {
@@ -559,9 +581,6 @@ const AgentStudioPage = () => {
           agentId: entry.agentId,
           patch: entry.patch,
         });
-      }
-      if (result.suggestedSelectedAgentId) {
-        dispatch({ type: "selectAgent", agentId: result.suggestedSelectedAgentId });
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to load agents.";
@@ -582,6 +601,95 @@ const AgentStudioPage = () => {
     status,
   ]);
 
+  const refreshGatewayConfigSnapshot = useCallback(async () => {
+    if (status !== "connected") return null;
+    try {
+      const snapshot = await client.call<GatewayModelPolicySnapshot>("config.get", {});
+      setGatewayConfigSnapshot(snapshot);
+      return snapshot;
+    } catch (err) {
+      if (!isGatewayDisconnectLikeError(err)) {
+        console.error("Failed to refresh gateway config.", err);
+      }
+      return null;
+    }
+  }, [client, status]);
+
+  const sandboxToolsRepairAttemptedRef = useRef(false);
+
+  useEffect(() => {
+    if (status !== "connected") return;
+    if (sandboxToolsRepairAttemptedRef.current) return;
+    const baseConfig =
+      gatewayConfigSnapshot?.config &&
+      typeof gatewayConfigSnapshot.config === "object" &&
+      !Array.isArray(gatewayConfigSnapshot.config)
+        ? (gatewayConfigSnapshot.config as Record<string, unknown>)
+        : null;
+    if (!baseConfig) return;
+
+    const list = readConfigAgentList(baseConfig);
+    const brokenAgentIds = list
+      .filter((entry) => {
+        const sandboxRaw =
+          entry && typeof (entry as Record<string, unknown>).sandbox === "object"
+            ? ((entry as Record<string, unknown>).sandbox as unknown)
+            : null;
+        const sandbox =
+          sandboxRaw && typeof sandboxRaw === "object" && !Array.isArray(sandboxRaw)
+            ? (sandboxRaw as Record<string, unknown>)
+            : null;
+        const mode = typeof sandbox?.mode === "string" ? sandbox.mode.trim().toLowerCase() : "";
+        if (mode !== "all") return false;
+
+        const toolsRaw =
+          entry && typeof (entry as Record<string, unknown>).tools === "object"
+            ? ((entry as Record<string, unknown>).tools as unknown)
+            : null;
+        const tools =
+          toolsRaw && typeof toolsRaw === "object" && !Array.isArray(toolsRaw)
+            ? (toolsRaw as Record<string, unknown>)
+            : null;
+        const sandboxBlock =
+          tools && typeof tools.sandbox === "object" && !Array.isArray(tools.sandbox)
+            ? (tools.sandbox as Record<string, unknown>)
+            : null;
+        const sandboxTools =
+          sandboxBlock && typeof sandboxBlock.tools === "object" && !Array.isArray(sandboxBlock.tools)
+            ? (sandboxBlock.tools as Record<string, unknown>)
+            : null;
+        const allow = sandboxTools?.allow;
+        return Array.isArray(allow) && allow.length === 0;
+      })
+      .map((entry) => entry.id);
+
+    if (brokenAgentIds.length === 0) return;
+    sandboxToolsRepairAttemptedRef.current = true;
+
+    void enqueueConfigMutation({
+      kind: "repair-sandbox-tool-allowlist",
+      label: "Repair sandbox tool access",
+      run: async () => {
+        for (const agentId of brokenAgentIds) {
+          await updateGatewayAgentOverrides({
+            client,
+            agentId,
+            overrides: {
+              tools: {
+                sandbox: {
+                  tools: {
+                    allow: ["*"],
+                  },
+                },
+              },
+            },
+          });
+        }
+        await loadAgents();
+      },
+    });
+  }, [client, enqueueConfigMutation, gatewayConfigSnapshot, loadAgents, status]);
+
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
@@ -595,11 +703,13 @@ const AgentStudioPage = () => {
     let cancelled = false;
     const key = gatewayUrl.trim();
     if (!key) {
+      preferredSelectedAgentIdRef.current = null;
       setFocusedPreferencesLoaded(true);
       return;
     }
     setFocusedPreferencesLoaded(false);
     focusFilterTouchedRef.current = false;
+    preferredSelectedAgentIdRef.current = null;
     const loadFocusedPreferences = async () => {
       try {
         const settings = await settingsCoordinator.loadSettings();
@@ -611,9 +721,11 @@ const AgentStudioPage = () => {
         }
         const preference = resolveFocusedPreference(settings, key);
         if (preference) {
+          preferredSelectedAgentIdRef.current = preference.selectedAgentId;
           setFocusFilter(preference.filter);
           return;
         }
+        preferredSelectedAgentIdRef.current = null;
         setFocusFilter("all");
       } catch (err) {
         console.error("Failed to load focused preference.", err);
@@ -653,6 +765,31 @@ const AgentStudioPage = () => {
   }, [focusFilter, gatewayUrl, settingsCoordinator]);
 
   useEffect(() => {
+    const key = gatewayUrl.trim();
+    if (!key) return;
+    if (status !== "connected") return;
+    if (!focusedPreferencesLoaded || !agentsLoadedOnce) return;
+    settingsCoordinator.schedulePatch(
+      {
+        focused: {
+          [key]: {
+            mode: "focused",
+            selectedAgentId: state.selectedAgentId,
+          },
+        },
+      },
+      300
+    );
+  }, [
+    agentsLoadedOnce,
+    focusedPreferencesLoaded,
+    gatewayUrl,
+    settingsCoordinator,
+    status,
+    state.selectedAgentId,
+  ]);
+
+  useEffect(() => {
     if (status !== "connected" || !focusedPreferencesLoaded) return;
     if (deleteAgentBlock && deleteAgentBlock.phase !== "queued") return;
     if (createAgentBlock && createAgentBlock.phase !== "queued") return;
@@ -674,6 +811,7 @@ const AgentStudioPage = () => {
     }
   }, [setLoading, status]);
 
+
   useEffect(() => {
     if (!settingsAgentId) return;
     if (state.selectedAgentId && state.selectedAgentId !== settingsAgentId) {
@@ -686,6 +824,12 @@ const AgentStudioPage = () => {
       setSettingsAgentId(null);
     }
   }, [settingsAgentId, settingsAgent]);
+
+  useEffect(() => {
+    if (!settingsAgentId) return;
+    if (status !== "connected") return;
+    void refreshGatewayConfigSnapshot();
+  }, [refreshGatewayConfigSnapshot, settingsAgentId, status]);
 
   useEffect(() => {
     if (!settingsAgentId || status !== "connected") {
@@ -704,6 +848,52 @@ const AgentStudioPage = () => {
     void loadCronJobsForSettingsAgent(settingsAgentId);
     void loadHeartbeatsForSettingsAgent(settingsAgentId);
   }, [loadCronJobsForSettingsAgent, loadHeartbeatsForSettingsAgent, settingsAgentId, status]);
+
+  useEffect(() => {
+    const nowMs = Date.now();
+    const delayMs = nextPendingApprovalPruneDelayMs({
+      approvalsByAgentId: pendingExecApprovalsByAgentId,
+      unscopedApprovals: unscopedPendingExecApprovals,
+      nowMs,
+      graceMs: PENDING_EXEC_APPROVAL_PRUNE_GRACE_MS,
+    });
+    if (delayMs === null) return;
+    const timerId = window.setTimeout(() => {
+      const pruneNowMs = Date.now();
+      setPendingExecApprovalsByAgentId((current) =>
+        pruneExpiredPendingApprovalsMap(current, {
+          nowMs: pruneNowMs,
+          graceMs: PENDING_EXEC_APPROVAL_PRUNE_GRACE_MS,
+        })
+      );
+      setUnscopedPendingExecApprovals((current) =>
+        pruneExpiredPendingApprovals(current, {
+          nowMs: pruneNowMs,
+          graceMs: PENDING_EXEC_APPROVAL_PRUNE_GRACE_MS,
+        })
+      );
+    }, delayMs);
+    return () => {
+      window.clearTimeout(timerId);
+    };
+  }, [pendingExecApprovalsByAgentId, unscopedPendingExecApprovals]);
+
+  useEffect(() => {
+    const pendingCountsByAgentId = new Map<string, number>();
+    for (const [agentId, approvals] of Object.entries(pendingExecApprovalsByAgentId)) {
+      if (approvals.length <= 0) continue;
+      pendingCountsByAgentId.set(agentId, approvals.length);
+    }
+    for (const agent of agents) {
+      const awaiting = (pendingCountsByAgentId.get(agent.agentId) ?? 0) > 0;
+      if (agent.awaitingUserInput === awaiting) continue;
+      dispatch({
+        type: "updateAgent",
+        agentId: agent.agentId,
+        patch: { awaitingUserInput: awaiting },
+      });
+    }
+  }, [agents, dispatch, pendingExecApprovalsByAgentId]);
 
   useEffect(() => {
     if (!brainPanelOpen) return;
@@ -770,22 +960,20 @@ const AgentStudioPage = () => {
   }, [client, status]);
 
   const loadSummarySnapshot = useCallback(async () => {
-    const activeAgents = stateRef.current.agents.filter((agent) => agent.sessionCreated);
-    const sessionKeys = Array.from(
-      new Set(
-        activeAgents
-          .map((agent) => agent.sessionKey)
-          .filter((key): key is string => typeof key === "string" && key.trim().length > 0)
-      )
-    ).slice(0, 64);
-    if (sessionKeys.length === 0) return;
+    const snapshotAgents = stateRef.current.agents;
+    const summaryIntent = resolveSummarySnapshotIntent({
+      agents: snapshotAgents,
+      maxKeys: 64,
+    });
+    if (summaryIntent.kind === "skip") return;
+    const activeAgents = snapshotAgents.filter((agent) => agent.sessionCreated);
     try {
       const [statusSummary, previewResult] = await Promise.all([
         client.call<SummaryStatusSnapshot>("status", {}),
         client.call<SummaryPreviewSnapshot>("sessions.preview", {
-          keys: sessionKeys,
-          limit: 8,
-          maxChars: 240,
+          keys: summaryIntent.keys,
+          limit: summaryIntent.limit,
+          maxChars: summaryIntent.maxChars,
         }),
       ]);
       for (const entry of buildSummarySnapshotPatches({
@@ -826,53 +1014,104 @@ const AgentStudioPage = () => {
   useEffect(() => {
     for (const agent of agents) {
       const lastMessage = agent.lastUserMessage?.trim() ?? "";
-      const kind = resolveSpecialUpdateKind(lastMessage);
+      const kind = resolveLatestUpdateKind(lastMessage);
       const key = agent.agentId;
       const marker = kind === "heartbeat" ? `${lastMessage}:${heartbeatTick}` : lastMessage;
       const previous = specialUpdateRef.current.get(key);
       if (previous === marker) continue;
       specialUpdateRef.current.set(key, marker);
-      void updateSpecialLatestUpdate(agent.agentId, agent, lastMessage);
+      void specialLatestUpdate.update(agent.agentId, agent, lastMessage);
     }
-  }, [agents, heartbeatTick, updateSpecialLatestUpdate]);
+  }, [agents, heartbeatTick, specialLatestUpdate]);
 
   const loadAgentHistory = useCallback(
-    async (agentId: string) => {
-      const agent = stateRef.current.agents.find((entry) => entry.agentId === agentId);
-      const sessionKey = agent?.sessionKey?.trim();
-      if (!agent || !agent.sessionCreated || !sessionKey) return;
-      if (historyInFlightRef.current.has(sessionKey)) return;
-
-      historyInFlightRef.current.add(sessionKey);
+    async (agentId: string, options?: { limit?: number }) => {
+      const historyRequestId = randomUUID();
       const loadedAt = Date.now();
-      try {
-        const result = await client.call<ChatHistoryResult>("chat.history", {
-          sessionKey,
-          limit: 200,
-        });
-        const patch = buildHistorySyncPatch({
-          messages: result.messages ?? [],
-          currentLines: agent.outputLines,
-          loadedAt,
-          status: agent.status,
-          runId: agent.runId,
-        });
-        dispatch({
-          type: "updateAgent",
-          agentId,
-          patch,
-        });
-      } catch (err) {
-        if (!isGatewayDisconnectLikeError(err)) {
-          const msg = err instanceof Error ? err.message : "Failed to load chat history.";
-          console.error(msg);
-        }
-      } finally {
-        historyInFlightRef.current.delete(sessionKey);
-      }
+      const commands = await runHistorySyncOperation({
+        client,
+        agentId,
+        requestedLimit: options?.limit,
+        getAgent: (targetAgentId) =>
+          stateRef.current.agents.find((entry) => entry.agentId === targetAgentId) ?? null,
+        inFlightSessionKeys: historyInFlightRef.current,
+        requestId: historyRequestId,
+        loadedAt,
+        defaultLimit: DEFAULT_CHAT_HISTORY_LIMIT,
+        maxLimit: MAX_CHAT_HISTORY_LIMIT,
+        transcriptV2Enabled: TRANSCRIPT_V2_ENABLED,
+      });
+      executeHistorySyncCommands({
+        commands,
+        dispatch,
+        logMetric: (metric, meta) => logTranscriptDebugMetric(metric, meta),
+        isDisconnectLikeError: isGatewayDisconnectLikeError,
+        logError: (message) => console.error(message),
+      });
     },
     [client, dispatch]
   );
+
+  const loadMoreAgentHistory = useCallback(
+    (agentId: string) => {
+      const agent = stateRef.current.agents.find((entry) => entry.agentId === agentId);
+      const currentLimit = agent?.historyFetchLimit ?? DEFAULT_CHAT_HISTORY_LIMIT;
+      const nextLimit = Math.min(MAX_CHAT_HISTORY_LIMIT, Math.max(400, currentLimit * 2));
+      void loadAgentHistory(agentId, { limit: nextLimit });
+    },
+    [loadAgentHistory]
+  );
+
+  const reconcileRunningAgents = useCallback(async () => {
+    if (status !== "connected") return;
+    const snapshot = stateRef.current.agents;
+    const commands = await runAgentReconcileOperation({
+      client,
+      agents: snapshot,
+      getLatestAgent: (agentId) =>
+        stateRef.current.agents.find((entry) => entry.agentId === agentId) ?? null,
+      claimRunId: (runId) => {
+        const normalized = runId.trim();
+        if (!normalized) return false;
+        if (reconcileRunInFlightRef.current.has(normalized)) return false;
+        reconcileRunInFlightRef.current.add(normalized);
+        return true;
+      },
+      releaseRunId: (runId) => {
+        const normalized = runId.trim();
+        if (!normalized) return;
+        reconcileRunInFlightRef.current.delete(normalized);
+      },
+      isDisconnectLikeError: isGatewayDisconnectLikeError,
+    });
+    executeAgentReconcileCommands({
+      commands,
+      dispatch,
+      clearRunTracking: (runId) => {
+        runtimeEventHandlerRef.current?.clearRunTracking(runId);
+      },
+      requestHistoryRefresh: (agentId) => {
+        void loadAgentHistory(agentId);
+      },
+      logInfo: (message) => {
+        console.info(message);
+      },
+      logWarn: (message, error) => {
+        console.warn(message, error);
+      },
+    });
+  }, [client, dispatch, loadAgentHistory, status]);
+
+  useEffect(() => {
+    if (status !== "connected") return;
+    void reconcileRunningAgents();
+    const timer = window.setInterval(() => {
+      void reconcileRunningAgents();
+    }, 3000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [reconcileRunningAgents, status]);
 
   useEffect(() => {
     if (status !== "connected") return;
@@ -893,21 +1132,26 @@ const AgentStudioPage = () => {
     [dispatch, flushPendingDraft, focusedAgent]
   );
 
-  const handleBrainToggle = useCallback(() => {
-    setBrainPanelOpen((prev) => {
-      const next = !prev;
-      if (!next) return false;
+  const handleOpenAgentBrain = useCallback(
+    (agentId: string) => {
+      flushPendingDraft(focusedAgent?.agentId ?? null);
       setSettingsAgentId(null);
+      setBrainPanelOpen(true);
       setMobilePane("brain");
-      return true;
-    });
-  }, []);
+      dispatch({ type: "selectAgent", agentId });
+    },
+    [dispatch, flushPendingDraft, focusedAgent]
+  );
 
   const handleDeleteAgent = useCallback(
     async (agentId: string) => {
-      if (deleteAgentBlock) return;
-      if (createAgentBlock) return;
-      if (renameAgentBlock) return;
+      const guard = resolveMutationStartGuard({
+        status: "connected",
+        hasCreateBlock: Boolean(createAgentBlock),
+        hasRenameBlock: Boolean(renameAgentBlock),
+        hasDeleteBlock: Boolean(deleteAgentBlock),
+      });
+      if (guard.kind === "deny") return;
       if (agentId === RESERVED_MAIN_AGENT_ID) {
         setError("The main agent cannot be deleted.");
         return;
@@ -918,18 +1162,28 @@ const AgentStudioPage = () => {
         `Delete ${agent.name}? This removes the agent from gateway config + cron and moves its workspace/state into ~/.openclaw/trash on the gateway host.`
       );
       if (!confirmed) return;
-      setDeleteAgentBlock({
-        agentId,
-        agentName: agent.name,
-        phase: "queued",
-        startedAt: Date.now(),
-        sawDisconnect: false,
-      });
-      try {
-        await enqueueConfigMutation({
-          kind: "delete-agent",
-          label: `Delete ${agent.name}`,
-          run: async () => {
+      await runAgentConfigMutationLifecycle({
+        kind: "delete-agent",
+        label: `Delete ${agent.name}`,
+        isLocalGateway,
+        deps: {
+          enqueueConfigMutation,
+          setQueuedBlock: () => {
+            const queuedDeleteBlock = buildQueuedMutationBlock({
+              kind: "delete-agent",
+              agentId,
+              agentName: agent.name,
+              startedAt: Date.now(),
+            });
+            setDeleteAgentBlock({
+              agentId: queuedDeleteBlock.agentId,
+              agentName: queuedDeleteBlock.agentName,
+              phase: "queued",
+              startedAt: queuedDeleteBlock.startedAt,
+              sawDisconnect: queuedDeleteBlock.sawDisconnect,
+            });
+          },
+          setMutatingBlock: () => {
             setDeleteAgentBlock((current) => {
               if (!current || current.agentId !== agentId) return current;
               return {
@@ -937,28 +1191,43 @@ const AgentStudioPage = () => {
                 phase: "deleting",
               };
             });
-	            await deleteAgentViaStudio({
-	              client,
-	              agentId,
-	              fetchJson,
-	              logError: (message, error) => console.error(message, error),
-	            });
-            setSettingsAgentId(null);
+          },
+          patchBlockAwaitingRestart: (patch) => {
             setDeleteAgentBlock((current) => {
               if (!current || current.agentId !== agentId) return current;
               return {
                 ...current,
-                phase: "awaiting-restart",
-                sawDisconnect: false,
+                ...patch,
               };
             });
           },
-        });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : "Failed to delete agent.";
-        setDeleteAgentBlock(null);
-        setError(msg);
-      }
+          clearBlock: () => {
+            setDeleteAgentBlock(null);
+          },
+          executeMutation: async () => {
+            await deleteAgentViaStudio({
+              client,
+              agentId,
+              fetchJson,
+              logError: (message, error) => console.error(message, error),
+            });
+            setSettingsAgentId(null);
+          },
+          shouldAwaitRemoteRestart: async () =>
+            shouldAwaitDisconnectRestartForRemoteMutation({
+              client,
+              cachedConfigSnapshot: gatewayConfigSnapshot,
+              logError: (message, error) => console.error(message, error),
+            }),
+          reloadAgents: loadAgents,
+          setMobilePaneChat: () => {
+            setMobilePane("chat");
+          },
+          onError: (message) => {
+            setError(message);
+          },
+        },
+      });
     },
     [
       agents,
@@ -966,6 +1235,9 @@ const AgentStudioPage = () => {
       createAgentBlock,
       deleteAgentBlock,
       enqueueConfigMutation,
+      gatewayConfigSnapshot,
+      isLocalGateway,
+      loadAgents,
       renameAgentBlock,
       setError,
     ]
@@ -988,12 +1260,39 @@ const AgentStudioPage = () => {
     },
   });
 
+  const handleCreateCronJob = useCallback(
+    async (agentId: string, draft: CronCreateDraft) => {
+      try {
+        await performCronCreateFlow({
+          client,
+          agentId,
+          draft,
+          busy: {
+            createBusy: cronCreateBusy,
+            runBusyJobId: cronRunBusyJobId,
+            deleteBusyJobId: cronDeleteBusyJobId,
+          },
+          onBusyChange: setCronCreateBusy,
+          onError: setSettingsCronError,
+          onJobs: setSettingsCronJobs,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to create cron job.";
+        if (!isGatewayDisconnectLikeError(err)) {
+          console.error(message);
+        }
+        throw err;
+      }
+    },
+    [client, cronCreateBusy, cronDeleteBusyJobId, cronRunBusyJobId]
+  );
+
   const handleRunCronJob = useCallback(
     async (agentId: string, jobId: string) => {
       const resolvedJobId = jobId.trim();
       const resolvedAgentId = agentId.trim();
       if (!resolvedJobId || !resolvedAgentId) return;
-      if (cronRunBusyJobId || cronDeleteBusyJobId) return;
+      if (cronCreateBusy || cronRunBusyJobId || cronDeleteBusyJobId) return;
       setCronRunBusyJobId(resolvedJobId);
       setSettingsCronError(null);
       try {
@@ -1007,7 +1306,7 @@ const AgentStudioPage = () => {
         setCronRunBusyJobId((current) => (current === resolvedJobId ? null : current));
       }
     },
-    [client, cronDeleteBusyJobId, cronRunBusyJobId, loadCronJobsForSettingsAgent]
+    [client, cronCreateBusy, cronDeleteBusyJobId, cronRunBusyJobId, loadCronJobsForSettingsAgent]
   );
 
   const handleDeleteCronJob = useCallback(
@@ -1015,7 +1314,7 @@ const AgentStudioPage = () => {
       const resolvedJobId = jobId.trim();
       const resolvedAgentId = agentId.trim();
       if (!resolvedJobId || !resolvedAgentId) return;
-      if (cronRunBusyJobId || cronDeleteBusyJobId) return;
+      if (cronCreateBusy || cronRunBusyJobId || cronDeleteBusyJobId) return;
       setCronDeleteBusyJobId(resolvedJobId);
       setSettingsCronError(null);
       try {
@@ -1032,7 +1331,7 @@ const AgentStudioPage = () => {
         setCronDeleteBusyJobId((current) => (current === resolvedJobId ? null : current));
       }
     },
-    [client, cronDeleteBusyJobId, cronRunBusyJobId, loadCronJobsForSettingsAgent]
+    [client, cronCreateBusy, cronDeleteBusyJobId, cronRunBusyJobId, loadCronJobsForSettingsAgent]
   );
 
   const handleRunHeartbeat = useCallback(
@@ -1089,106 +1388,194 @@ const AgentStudioPage = () => {
     [client, heartbeatDeleteBusyId, heartbeatRunBusyId, loadHeartbeatsForSettingsAgent]
   );
 
-  const handleCreateAgent = useCallback(async () => {
+  const handleOpenCreateAgentModal = useCallback(() => {
     if (createAgentBusy) return;
     if (createAgentBlock) return;
     if (deleteAgentBlock) return;
     if (renameAgentBlock) return;
-    if (status !== "connected") {
-      setError("Connect to gateway before creating an agent.");
+    setCreateAgentModalError(null);
+    setCreateAgentModalOpen(true);
+  }, [createAgentBlock, createAgentBusy, deleteAgentBlock, renameAgentBlock]);
+
+  const persistAvatarSeed = useCallback(
+    (agentId: string, avatarSeed: string) => {
+      const resolvedAgentId = agentId.trim();
+      const resolvedAvatarSeed = avatarSeed.trim();
+      const key = gatewayUrl.trim();
+      if (!resolvedAgentId || !resolvedAvatarSeed || !key) return;
+      settingsCoordinator.schedulePatch(
+        {
+          avatars: {
+            [key]: {
+              [resolvedAgentId]: resolvedAvatarSeed,
+            },
+          },
+        },
+        0
+      );
+    },
+    [gatewayUrl, settingsCoordinator]
+  );
+
+  const handleCreateAgentSubmit = useCallback(
+    async (payload: AgentCreateModalSubmitPayload) => {
+      await runCreateAgentMutationLifecycle(
+        {
+          payload,
+          status,
+          hasCreateBlock: Boolean(createAgentBlock),
+          hasRenameBlock: Boolean(renameAgentBlock),
+          hasDeleteBlock: Boolean(deleteAgentBlock),
+          createAgentBusy,
+        },
+        {
+          enqueueConfigMutation,
+          createAgent: async (name, avatarSeed) => {
+            const created = await createGatewayAgent({ client, name });
+            if (avatarSeed) {
+              persistAvatarSeed(created.id, avatarSeed);
+            }
+            flushPendingDraft(focusedAgent?.agentId ?? null);
+            focusFilterTouchedRef.current = true;
+            setFocusFilter("all");
+            dispatch({ type: "selectAgent", agentId: created.id });
+            return { id: created.id };
+          },
+          setQueuedBlock: ({ agentName, startedAt }) => {
+            const queuedCreateBlock = buildQueuedMutationBlock({
+              kind: "create-agent",
+              agentId: "",
+              agentName,
+              startedAt,
+            });
+            setCreateAgentBlock({
+              agentName: queuedCreateBlock.agentName,
+              phase: "queued",
+              startedAt: queuedCreateBlock.startedAt,
+            });
+          },
+          setCreatingBlock: (agentName) => {
+            setCreateAgentBlock((current) => {
+              if (!current || current.agentName !== agentName) return current;
+              return { ...current, phase: "creating" };
+            });
+          },
+          onCompletion: async (completion) => {
+            await loadAgents();
+            let createdAgent =
+              stateRef.current.agents.find((entry) => entry.agentId === completion.agentId) ?? null;
+            if (!createdAgent) {
+              await loadAgents();
+              createdAgent =
+                stateRef.current.agents.find((entry) => entry.agentId === completion.agentId) ??
+                null;
+            }
+            if (!createdAgent) {
+              const message = `Agent "${completion.agentName}" was created, but Studio could not load it yet.`;
+              setCreateAgentModalError(message);
+              setError(message);
+              setCreateAgentBlock(null);
+              setCreateAgentModalOpen(false);
+              return;
+            }
+
+            let bootstrapError: string | null = null;
+            if (
+              createdAgent.sessionExecSecurity !== "full" ||
+              createdAgent.sessionExecAsk !== "off"
+            ) {
+              try {
+                await updateExecutionRoleViaStudio({
+                  client,
+                  agentId: createdAgent.agentId,
+                  sessionKey: createdAgent.sessionKey,
+                  role: "autonomous",
+                  loadAgents: async () => {},
+                });
+                await loadAgents();
+                await refreshGatewayConfigSnapshot();
+              } catch (err) {
+                bootstrapError =
+                  err instanceof Error ? err.message : "Failed to apply autonomous defaults.";
+                setError(
+                  `Agent created, but autonomous defaults could not be applied: ${bootstrapError}`
+                );
+              }
+            }
+
+            handleOpenAgentSettings(completion.agentId);
+            if (bootstrapError) {
+              setCreateAgentModalError(`Autonomous defaults failed: ${bootstrapError}`);
+            } else {
+              setCreateAgentModalError(null);
+            }
+            setCreateAgentBlock(null);
+            setCreateAgentModalOpen(false);
+          },
+          setCreateAgentModalError,
+          setCreateAgentBusy,
+          clearCreateBlock: () => {
+            setCreateAgentBlock(null);
+          },
+          onError: setError,
+        }
+      );
+    },
+    [
+      client,
+      createAgentBusy,
+      createAgentBlock,
+      deleteAgentBlock,
+      dispatch,
+      enqueueConfigMutation,
+      flushPendingDraft,
+      focusedAgent,
+      handleOpenAgentSettings,
+      loadAgents,
+      persistAvatarSeed,
+      refreshGatewayConfigSnapshot,
+      renameAgentBlock,
+      setError,
+      status,
+    ]
+  );
+
+  useEffect(() => {
+    if (!createAgentBlock || createAgentBlock.phase === "queued") return;
+    const maxWaitMs = 90_000;
+    const timeoutNow = isCreateBlockTimedOut({
+      block: createAgentBlock,
+      nowMs: Date.now(),
+      maxWaitMs,
+    });
+    const handleTimeout = () => {
+      setCreateAgentBlock(null);
+      setCreateAgentModalOpen(false);
+      void loadAgents();
+      setError("Agent creation timed out.");
+    };
+    if (timeoutNow) {
+      handleTimeout();
       return;
     }
-    setCreateAgentBusy(true);
-    try {
-      const name = resolveNextNewAgentName(stateRef.current.agents);
-      setCreateAgentBlock({
-        agentId: null,
-        agentName: name,
-        phase: "queued",
-        startedAt: Date.now(),
-        sawDisconnect: false,
-      });
-      await enqueueConfigMutation({
-        kind: "create-agent",
-        label: `Create ${name}`,
-        run: async () => {
-          setCreateAgentBlock((current) => {
-            if (!current || current.agentName !== name) return current;
-            return { ...current, phase: "creating" };
-          });
-          const created = await createGatewayAgent({ client, name });
-          flushPendingDraft(focusedAgent?.agentId ?? null);
-          focusFilterTouchedRef.current = true;
-          setFocusFilter("all");
-          dispatch({ type: "selectAgent", agentId: created.id });
-          setSettingsAgentId(null);
-          setMobilePane("chat");
-          setCreateAgentBlock((current) => {
-            if (!current || current.agentName !== name) return current;
-            return {
-              ...current,
-              agentId: created.id,
-              phase: "awaiting-restart",
-              sawDisconnect: false,
-            };
-          });
-        },
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to create agent.";
-      setCreateAgentBlock(null);
-      setError(message);
-    } finally {
-      setCreateAgentBusy(false);
-    }
-  }, [
-    client,
-    createAgentBusy,
-    createAgentBlock,
-    deleteAgentBlock,
-    flushPendingDraft,
-    focusedAgent,
-    renameAgentBlock,
-    dispatch,
-    enqueueConfigMutation,
-    setError,
-    status,
-  ]);
-
-  useGatewayRestartBlock({
-    status,
-    block: createAgentBlock,
-    setBlock: setCreateAgentBlock,
-    maxWaitMs: 90_000,
-    onTimeout: () => {
-      setCreateAgentBlock(null);
-      setError("Gateway restart timed out after creating the agent.");
-    },
-    onRestartComplete: async (block, ctx) => {
-      await loadAgents();
-      if (ctx.isCancelled()) return;
-      const newAgentId = block.agentId?.trim() ?? "";
-      if (newAgentId) {
-        dispatch({ type: "selectAgent", agentId: newAgentId });
-        setCreateAgentBlock((current) => {
-          if (!current || current.agentId !== newAgentId) return current;
-          return { ...current, phase: "bootstrapping-files" };
-        });
-        try {
-          await bootstrapAgentBrainFilesFromTemplate({ client, agentId: newAgentId });
-        } catch (err) {
-          const message =
-            err instanceof Error
-              ? err.message
-              : "Failed to bootstrap brain files for the new agent.";
-          console.error(message, err);
-          setError(message);
-        }
+    const elapsed = Date.now() - createAgentBlock.startedAt;
+    const remaining = Math.max(0, maxWaitMs - elapsed);
+    const timeoutId = window.setTimeout(() => {
+      if (
+        !isCreateBlockTimedOut({
+          block: createAgentBlock,
+          nowMs: Date.now(),
+          maxWaitMs,
+        })
+      ) {
+        return;
       }
-      setCreateAgentBlock(null);
-      setMobilePane("chat");
-    },
-  });
+      handleTimeout();
+    }, remaining);
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [createAgentBlock, loadAgents, setError]);
 
   useGatewayRestartBlock({
     status,
@@ -1224,7 +1611,7 @@ const AgentStudioPage = () => {
         runtimeEventHandlerRef.current?.clearRunTracking(agent.runId);
         historyInFlightRef.current.delete(sessionKey);
         specialUpdateRef.current.delete(agentId);
-        specialUpdateInFlightRef.current.delete(agentId);
+        specialLatestUpdate.clearInFlight(agentId);
         dispatch({
           type: "updateAgent",
           agentId,
@@ -1270,6 +1657,7 @@ const AgentStudioPage = () => {
         pendingDraftTimersRef.current.delete(agentId);
       }
       pendingDraftValuesRef.current.delete(agentId);
+      clearPendingLivePatch(agentId);
       await sendChatMessageViaStudio({
         client,
         dispatch,
@@ -1281,7 +1669,7 @@ const AgentStudioPage = () => {
         clearRunTracking: (runId) => runtimeEventHandlerRef.current?.clearRunTracking(runId),
       });
     },
-    [client, dispatch]
+    [client, clearPendingLivePatch, dispatch]
   );
 
   const handleStopRun = useCallback(
@@ -1376,26 +1764,279 @@ const AgentStudioPage = () => {
     [dispatch]
   );
 
+  const handleResolveExecApproval = useCallback(
+    async (approvalId: string, decision: ExecApprovalDecision) => {
+      await resolveExecApprovalViaStudio({
+        client,
+        approvalId,
+        decision,
+        getAgents: () => stateRef.current.agents,
+        getLatestAgent: (agentId) =>
+          stateRef.current.agents.find((entry) => entry.agentId === agentId) ?? null,
+        getPendingState: () => ({
+          approvalsByAgentId: pendingExecApprovalsByAgentId,
+          unscopedApprovals: unscopedPendingExecApprovals,
+        }),
+        setPendingExecApprovalsByAgentId,
+        setUnscopedPendingExecApprovals,
+        requestHistoryRefresh: (agentId) => loadAgentHistory(agentId),
+        onAllowResolved: ({ approval, targetAgentId }) => {
+          const scopedPending = (pendingExecApprovalsByAgentId[targetAgentId] ?? []).some(
+            (pendingApproval) => pendingApproval.id !== approval.id
+          );
+          const targetSessionKey = approval.sessionKey?.trim() ?? "";
+          const unscopedPending = unscopedPendingExecApprovals.some((pendingApproval) => {
+            if (pendingApproval.id === approval.id) return false;
+            const pendingAgentId = pendingApproval.agentId?.trim() ?? "";
+            if (pendingAgentId && pendingAgentId === targetAgentId) return true;
+            if (!targetSessionKey) return false;
+            return (pendingApproval.sessionKey?.trim() ?? "") === targetSessionKey;
+          });
+          if (scopedPending || unscopedPending) return;
+          const latest =
+            stateRef.current.agents.find((entry) => entry.agentId === targetAgentId) ?? null;
+          if (!latest) return;
+          const pausedRunId =
+            approvalPausedRunIdByAgentRef.current.get(targetAgentId)?.trim() ?? "";
+          const nowMs = Date.now();
+          dispatch({
+            type: "updateAgent",
+            agentId: targetAgentId,
+            patch: {
+              status: "running",
+              sessionCreated: true,
+              lastActivityAt: nowMs,
+              ...(pausedRunId ? { runId: pausedRunId } : {}),
+              ...(latest.runStartedAt === null ? { runStartedAt: nowMs } : {}),
+            },
+          });
+        },
+        onAllowed: async ({ approval, targetAgentId }) => {
+          const pausedByAgent = approvalPausedRunIdByAgentRef.current;
+          const pausedRunId = pausedByAgent.get(targetAgentId) ?? null;
+          if (!pausedRunId) return;
+
+          const scopedPending = (pendingExecApprovalsByAgentId[targetAgentId] ?? []).some(
+            (pendingApproval) => pendingApproval.id !== approval.id
+          );
+          const targetSessionKey = approval.sessionKey?.trim() ?? "";
+          const unscopedPending = unscopedPendingExecApprovals.some((pendingApproval) => {
+            if (pendingApproval.id === approval.id) return false;
+            const pendingAgentId = pendingApproval.agentId?.trim() ?? "";
+            if (pendingAgentId && pendingAgentId === targetAgentId) return true;
+            if (!targetSessionKey) return false;
+            return (pendingApproval.sessionKey?.trim() ?? "") === targetSessionKey;
+          });
+          if (scopedPending || unscopedPending) {
+            return;
+          }
+
+          pausedByAgent.delete(targetAgentId);
+          try {
+            await client.call("agent.wait", { runId: pausedRunId, timeoutMs: 15_000 });
+          } catch (waitError) {
+            if (!isGatewayDisconnectLikeError(waitError)) {
+              console.warn("Failed waiting for paused run before auto-resume.", waitError);
+            }
+          }
+
+          const latest = stateRef.current.agents.find((entry) => entry.agentId === targetAgentId) ?? null;
+          if (!latest || latest.status === "running") return;
+          const sessionKey = latest.sessionKey.trim();
+          if (!sessionKey) return;
+
+          await sendChatMessageViaStudio({
+            client,
+            dispatch,
+            getAgent: (agentId) =>
+              stateRef.current.agents.find((entry) => entry.agentId === agentId) ?? null,
+            agentId: targetAgentId,
+            sessionKey,
+            message: `${EXEC_APPROVAL_AUTO_RESUME_MARKER}\nContinue where you left off and finish the task.`,
+            clearRunTracking: (runId) => runtimeEventHandlerRef.current?.clearRunTracking(runId),
+            echoUserMessage: false,
+          });
+        },
+        isDisconnectLikeError: isGatewayDisconnectLikeError,
+        logWarn: (message, error) => console.warn(message, error),
+      });
+    },
+    [client, dispatch, loadAgentHistory, pendingExecApprovalsByAgentId, unscopedPendingExecApprovals]
+  );
+
+  const pauseRunForExecApproval = useCallback(
+    async (approval: PendingExecApproval, preferredAgentId?: string | null) => {
+      if (status !== "connected") return;
+
+      const pausedByAgent = approvalPausedRunIdByAgentRef.current;
+      for (const [trackedAgentId, trackedRunId] of pausedByAgent.entries()) {
+        const trackedAgent = stateRef.current.agents.find((entry) => entry.agentId === trackedAgentId);
+        const currentRunId = trackedAgent?.runId?.trim() ?? "";
+        if (!currentRunId || currentRunId !== trackedRunId) {
+          pausedByAgent.delete(trackedAgentId);
+        }
+      }
+
+      const preferred = preferredAgentId?.trim() ?? "";
+      const approvalSessionKey = approval.sessionKey?.trim() ?? "";
+      const agent =
+        (preferred
+          ? stateRef.current.agents.find((entry) => entry.agentId === preferred)
+          : null) ??
+        (approvalSessionKey
+          ? stateRef.current.agents.find((entry) => entry.sessionKey.trim() === approvalSessionKey)
+          : null) ??
+        null;
+      if (!agent) return;
+
+      const runId = agent.runId?.trim() ?? "";
+      if (!runId) return;
+
+      const pausedRunId = pausedByAgent.get(agent.agentId) ?? null;
+      if (
+        !shouldPauseRunForPendingExecApproval({
+          agent,
+          approval,
+          pausedRunId,
+        })
+      ) {
+        return;
+      }
+
+      const sessionKey = agent.sessionKey.trim();
+      if (!sessionKey) return;
+      pausedByAgent.set(agent.agentId, runId);
+      try {
+        await client.call("chat.abort", { sessionKey });
+      } catch (err) {
+        pausedByAgent.delete(agent.agentId);
+        if (!isGatewayDisconnectLikeError(err)) {
+          console.warn("Failed to pause run for pending exec approval.", err);
+        }
+      }
+    },
+    [client, status]
+  );
+
+  const handleGatewayEventIngress = useCallback(
+    (event: EventFrame) => {
+      const ingressDecision = resolveGatewayEventIngressDecision({
+        event,
+        agents: stateRef.current.agents,
+        seenCronDedupeKeys: seenCronEventIdsRef.current,
+        nowMs: Date.now(),
+      });
+
+      const effects = ingressDecision.approvalEffects;
+      if (effects) {
+        for (const removalId of effects.removals) {
+          setPendingExecApprovalsByAgentId((current) => {
+            return removePendingApprovalEverywhere({
+              approvalsByAgentId: current,
+              unscopedApprovals: [],
+              approvalId: removalId,
+            }).approvalsByAgentId;
+          });
+          setUnscopedPendingExecApprovals((current) => {
+            return removePendingApprovalEverywhere({
+              approvalsByAgentId: {},
+              unscopedApprovals: current,
+              approvalId: removalId,
+            }).unscopedApprovals;
+          });
+        }
+        for (const scopedUpsert of effects.scopedUpserts) {
+          setPendingExecApprovalsByAgentId((current) => {
+            const withoutExisting = removePendingApprovalByIdMap(current, scopedUpsert.approval.id);
+            const existing = withoutExisting[scopedUpsert.agentId] ?? [];
+            const upserted = upsertPendingApproval(existing, scopedUpsert.approval);
+            if (upserted === existing) return withoutExisting;
+            return {
+              ...withoutExisting,
+              [scopedUpsert.agentId]: upserted,
+            };
+          });
+          setUnscopedPendingExecApprovals((current) =>
+            removePendingApprovalById(current, scopedUpsert.approval.id)
+          );
+          void pauseRunForExecApproval(scopedUpsert.approval, scopedUpsert.agentId);
+        }
+        for (const unscopedUpsert of effects.unscopedUpserts) {
+          setPendingExecApprovalsByAgentId((current) =>
+            removePendingApprovalByIdMap(current, unscopedUpsert.id)
+          );
+          setUnscopedPendingExecApprovals((current) => {
+            const withoutExisting = removePendingApprovalById(current, unscopedUpsert.id);
+            return upsertPendingApproval(withoutExisting, unscopedUpsert);
+          });
+          void pauseRunForExecApproval(unscopedUpsert);
+        }
+        for (const agentId of effects.markActivityAgentIds) {
+          dispatch({ type: "markActivity", agentId });
+        }
+      }
+
+      if (ingressDecision.cronDedupeKeyToRecord) {
+        seenCronEventIdsRef.current.add(ingressDecision.cronDedupeKeyToRecord);
+      }
+      if (!ingressDecision.cronTranscriptIntent) {
+        return;
+      }
+      const intent = ingressDecision.cronTranscriptIntent;
+      dispatch({
+        type: "appendOutput",
+        agentId: intent.agentId,
+        line: intent.line,
+        transcript: {
+          source: "runtime-agent",
+          role: "assistant",
+          kind: "assistant",
+          sessionKey: intent.sessionKey,
+          timestampMs: intent.timestampMs,
+          entryId: intent.dedupeKey,
+          confirmed: true,
+        },
+      });
+      dispatch({
+        type: "markActivity",
+        agentId: intent.agentId,
+        at: intent.activityAtMs ?? undefined,
+      });
+    },
+    [dispatch, pauseRunForExecApproval]
+  );
+
   useEffect(() => {
     const handler = createGatewayRuntimeEventHandler({
       getStatus: () => status,
       getAgents: () => stateRef.current.agents,
       dispatch,
       queueLivePatch,
+      clearPendingLivePatch,
       loadSummarySnapshot,
-      loadAgentHistory,
+      requestHistoryRefresh: ({ agentId }) => loadAgentHistory(agentId),
       refreshHeartbeatLatestUpdate,
       bumpHeartbeatTick: () => setHeartbeatTick((prev) => prev + 1),
       setTimeout: (fn, delayMs) => window.setTimeout(fn, delayMs),
       clearTimeout: (id) => window.clearTimeout(id),
       isDisconnectLikeError: isGatewayDisconnectLikeError,
       logWarn: (message, meta) => console.warn(message, meta),
+      shouldSuppressRunAbortedLine: ({ agentId, runId, stopReason }) => {
+        if (stopReason !== "rpc") return false;
+        const normalizedRunId = runId?.trim() ?? "";
+        if (!normalizedRunId) return false;
+        const pausedRunId = approvalPausedRunIdByAgentRef.current.get(agentId)?.trim() ?? "";
+        return pausedRunId.length > 0 && pausedRunId === normalizedRunId;
+      },
       updateSpecialLatestUpdate: (agentId, agent, message) => {
-        void updateSpecialLatestUpdate(agentId, agent, message);
+        void specialLatestUpdate.update(agentId, agent, message);
       },
     });
     runtimeEventHandlerRef.current = handler;
-    const unsubscribe = client.onEvent((event: EventFrame) => handler.handleEvent(event));
+    const unsubscribe = client.onEvent((event: EventFrame) => {
+      handler.handleEvent(event);
+      handleGatewayEventIngress(event);
+    });
     return () => {
       runtimeEventHandlerRef.current = null;
       handler.dispose();
@@ -1406,63 +2047,99 @@ const AgentStudioPage = () => {
     dispatch,
     loadAgentHistory,
     loadSummarySnapshot,
+    clearPendingLivePatch,
     queueLivePatch,
     refreshHeartbeatLatestUpdate,
+    specialLatestUpdate,
+    handleGatewayEventIngress,
     status,
-    updateSpecialLatestUpdate,
   ]);
+
+  useEffect(() => {
+    return client.onGap((info) => {
+      console.warn(`Gateway event gap expected ${info.expected}, received ${info.received}.`);
+      void loadSummarySnapshot();
+      void reconcileRunningAgents();
+    });
+  }, [client, loadSummarySnapshot, reconcileRunningAgents]);
 
   const handleRenameAgent = useCallback(
     async (agentId: string, name: string) => {
-      if (deleteAgentBlock) return false;
-      if (createAgentBlock) return false;
-      if (renameAgentBlock) return false;
+      const guard = resolveMutationStartGuard({
+        status: "connected",
+        hasCreateBlock: Boolean(createAgentBlock),
+        hasRenameBlock: Boolean(renameAgentBlock),
+        hasDeleteBlock: Boolean(deleteAgentBlock),
+      });
+      if (guard.kind === "deny") return false;
       const agent = agents.find((entry) => entry.agentId === agentId);
       if (!agent) return false;
-      try {
-        setRenameAgentBlock({
-          agentId,
-          agentName: name,
-          phase: "queued",
-          startedAt: Date.now(),
-          sawDisconnect: false,
-        });
-        await enqueueConfigMutation({
-          kind: "rename-agent",
-          label: `Rename ${agent.name}`,
-          run: async () => {
+      return await runAgentConfigMutationLifecycle({
+        kind: "rename-agent",
+        label: `Rename ${agent.name}`,
+        isLocalGateway,
+        deps: {
+          enqueueConfigMutation,
+          setQueuedBlock: () => {
+            const queuedRenameBlock = buildQueuedMutationBlock({
+              kind: "rename-agent",
+              agentId,
+              agentName: name,
+              startedAt: Date.now(),
+            });
+            setRenameAgentBlock({
+              agentId: queuedRenameBlock.agentId,
+              agentName: queuedRenameBlock.agentName,
+              phase: "queued",
+              startedAt: queuedRenameBlock.startedAt,
+              sawDisconnect: queuedRenameBlock.sawDisconnect,
+            });
+          },
+          setMutatingBlock: () => {
             setRenameAgentBlock((current) => {
               if (!current || current.agentId !== agentId) return current;
               return { ...current, phase: "renaming" };
             });
+          },
+          patchBlockAwaitingRestart: (patch) => {
+            setRenameAgentBlock((current) => {
+              if (!current || current.agentId !== agentId) return current;
+              return {
+                ...current,
+                ...patch,
+              };
+            });
+          },
+          clearBlock: () => {
+            setRenameAgentBlock(null);
+          },
+          executeMutation: async () => {
             await renameGatewayAgent({
               client,
               agentId,
               name,
-              sessionKey: agent.sessionKey,
             });
             dispatch({
               type: "updateAgent",
               agentId,
               patch: { name },
             });
-            setRenameAgentBlock((current) => {
-              if (!current || current.agentId !== agentId) return current;
-              return {
-                ...current,
-                phase: "awaiting-restart",
-                sawDisconnect: false,
-              };
-            });
           },
-        });
-        return true;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Failed to rename agent.";
-        setRenameAgentBlock(null);
-        setError(message);
-        return false;
-      }
+          shouldAwaitRemoteRestart: async () =>
+            shouldAwaitDisconnectRestartForRemoteMutation({
+              client,
+              cachedConfigSnapshot: gatewayConfigSnapshot,
+              logError: (message, error) => console.error(message, error),
+            }),
+          reloadAgents: loadAgents,
+          setMobilePaneChat: () => {
+            setMobilePane("chat");
+          },
+          onError: (message) => {
+            setError(message);
+          },
+        },
+      });
     },
     [
       agents,
@@ -1471,33 +2148,70 @@ const AgentStudioPage = () => {
       deleteAgentBlock,
       dispatch,
       enqueueConfigMutation,
+      gatewayConfigSnapshot,
+      isLocalGateway,
+      loadAgents,
       renameAgentBlock,
       setError,
     ]
   );
 
+  const handleUpdateAgentPermissions = useCallback(
+    async (agentId: string, draft: AgentPermissionsDraft) => {
+      const guard = resolveMutationStartGuard({
+        status: "connected",
+        hasCreateBlock: Boolean(createAgentBlock),
+        hasRenameBlock: Boolean(renameAgentBlock),
+        hasDeleteBlock: Boolean(deleteAgentBlock),
+      });
+      if (guard.kind === "deny") return;
+
+      const resolvedAgentId = agentId.trim();
+      if (!resolvedAgentId) return;
+      const agent = agents.find((entry) => entry.agentId === resolvedAgentId) ?? null;
+      if (!agent) return;
+
+      await enqueueConfigMutation({
+        kind: "update-agent-permissions",
+        label: `Update permissions for ${agent.name}`,
+        run: async () => {
+          await updateAgentPermissionsViaStudio({
+            client,
+            agentId: resolvedAgentId,
+            sessionKey: agent.sessionKey,
+            draft,
+            loadAgents: async () => {},
+          });
+          await loadAgents();
+          await refreshGatewayConfigSnapshot();
+          setSettingsAgentId(resolvedAgentId);
+          setMobilePane("settings");
+        },
+      });
+    },
+    [
+      agents,
+      client,
+      createAgentBlock,
+      deleteAgentBlock,
+      enqueueConfigMutation,
+      loadAgents,
+      refreshGatewayConfigSnapshot,
+      renameAgentBlock,
+    ]
+  );
+
   const handleAvatarShuffle = useCallback(
     async (agentId: string) => {
-      const avatarSeed = crypto.randomUUID();
+      const avatarSeed = randomUUID();
       dispatch({
         type: "updateAgent",
         agentId,
         patch: { avatarSeed },
       });
-      const key = gatewayUrl.trim();
-      if (!key) return;
-      settingsCoordinator.schedulePatch(
-        {
-          avatars: {
-            [key]: {
-              [agentId]: avatarSeed,
-            },
-          },
-        },
-        0
-      );
+      persistAvatarSeed(agentId, avatarSeed);
     },
-    [dispatch, gatewayUrl, settingsCoordinator]
+    [dispatch, persistAvatarSeed]
   );
 
   const handleDraftChange = useCallback(
@@ -1539,48 +2253,91 @@ const AgentStudioPage = () => {
       ? "Waiting for active runs to finish"
       : createAgentBlock.phase === "creating"
       ? "Submitting config change"
-      : createAgentBlock.phase === "bootstrapping-files"
-        ? "Bootstrapping brain files"
-      : !createAgentBlock.sawDisconnect
-        ? "Waiting for gateway to restart"
-        : status === "connected"
-          ? "Gateway is back online, syncing agents"
-          : "Gateway restart in progress"
+      : null
     : null;
-  const renameBlockStatusLine = renameAgentBlock
-    ? renameAgentBlock.phase === "queued"
-      ? "Waiting for active runs to finish"
-      : renameAgentBlock.phase === "renaming"
-      ? "Submitting config change"
-      : !renameAgentBlock.sawDisconnect
-        ? "Waiting for gateway to restart"
-        : status === "connected"
-          ? "Gateway is back online, syncing agents"
-          : "Gateway restart in progress"
-    : null;
-  const deleteBlockStatusLine = deleteAgentBlock
-    ? deleteAgentBlock.phase === "queued"
-      ? "Waiting for active runs to finish"
-      : deleteAgentBlock.phase === "deleting"
-      ? "Submitting config change"
-      : !deleteAgentBlock.sawDisconnect
-        ? "Waiting for gateway to restart"
-        : status === "connected"
-          ? "Gateway is back online, syncing agents"
-          : "Gateway restart in progress"
-      : null;
+  const renameBlockStatusLine = resolveConfigMutationStatusLine({
+    block: renameAgentBlock
+      ? {
+          phase: renameAgentBlock.phase === "renaming" ? "mutating" : renameAgentBlock.phase,
+          sawDisconnect: renameAgentBlock.sawDisconnect,
+        }
+      : null,
+    status,
+  });
+  const deleteBlockStatusLine = resolveConfigMutationStatusLine({
+    block: deleteAgentBlock
+      ? {
+          phase: deleteAgentBlock.phase === "deleting" ? "mutating" : deleteAgentBlock.phase,
+          sawDisconnect: deleteAgentBlock.sawDisconnect,
+        }
+      : null,
+    status,
+  });
 
-  if (status === "connecting" || (status === "connected" && !agentsLoadedOnce)) {
+  useEffect(() => {
+    if (status === "connecting") {
+      setDidAttemptGatewayConnect(true);
+    }
+  }, [status]);
+
+  useEffect(() => {
+    if (gatewayError) {
+      setDidAttemptGatewayConnect(true);
+    }
+  }, [gatewayError]);
+
+  if (!agentsLoadedOnce && (!didAttemptGatewayConnect || status === "connecting")) {
     return (
       <div className="relative min-h-screen w-screen overflow-hidden bg-background">
         <div className="flex min-h-screen items-center justify-center px-6">
-          <div className="glass-panel w-full max-w-md px-6 py-6 text-center">
+          <div className="glass-panel ui-panel w-full max-w-md px-6 py-6 text-center">
             <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
               OpenClaw Studio
             </div>
             <div className="mt-3 text-sm text-muted-foreground">
-              {status === "connecting" ? "Connecting to gateway…" : "Loading agents…"}
+              {status === "connecting" ? "Connecting to gateway…" : "Booting Studio…"}
             </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (status === "disconnected" && !agentsLoadedOnce && didAttemptGatewayConnect) {
+    return (
+      <div className="relative min-h-screen w-screen overflow-hidden bg-background">
+        <div className="relative z-10 flex h-screen flex-col gap-4 px-3 py-3 sm:px-4 sm:py-4 md:px-6 md:py-6">
+          <div className="w-full">
+            <HeaderBar
+              status={status}
+              onConnectionSettings={() => setShowConnectionPanel(true)}
+            />
+          </div>
+          <GatewayConnectScreen
+            gatewayUrl={gatewayUrl}
+            token={token}
+            localGatewayDefaults={localGatewayDefaults}
+            status={status}
+            error={gatewayError}
+            onGatewayUrlChange={setGatewayUrl}
+            onTokenChange={setToken}
+            onUseLocalDefaults={useLocalGatewayDefaults}
+            onConnect={() => void connect()}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (status === "connected" && !agentsLoadedOnce) {
+    return (
+      <div className="relative min-h-screen w-screen overflow-hidden bg-background">
+        <div className="flex min-h-screen items-center justify-center px-6">
+          <div className="glass-panel ui-panel w-full max-w-md px-6 py-6 text-center">
+            <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+              OpenClaw Studio
+            </div>
+            <div className="mt-3 text-sm text-muted-foreground">Loading agents…</div>
           </div>
         </div>
       </div>
@@ -1591,25 +2348,22 @@ const AgentStudioPage = () => {
     <div className="relative min-h-screen w-screen overflow-hidden bg-background">
       {state.loading ? (
         <div className="pointer-events-none fixed bottom-4 left-0 right-0 z-50 flex justify-center px-3">
-          <div className="glass-panel px-6 py-3 font-mono text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
+          <div className="glass-panel ui-card px-6 py-3 font-mono text-[11px] tracking-[0.08em] text-muted-foreground">
             Loading agents…
           </div>
         </div>
       ) : null}
-      <div className="relative z-10 flex h-screen flex-col gap-4 px-3 py-3 sm:px-4 sm:py-4 md:px-6 md:py-6">
+      <div className="relative z-10 flex h-screen flex-col gap-3 px-3 py-3 sm:px-4 sm:py-4 md:px-5 md:py-5">
         <div className="w-full">
           <HeaderBar
             status={status}
-            onConnectionSettings={() => setShowConnectionPanel((prev) => !prev)}
-            onBrainFiles={handleBrainToggle}
-            brainFilesOpen={brainPanelOpen}
-            brainDisabled={!hasAnyAgents}
+            onConnectionSettings={() => setShowConnectionPanel(true)}
           />
         </div>
 
         {connectionPanelVisible ? (
-          <div className="w-full">
-            <div className="glass-panel px-4 py-4 sm:px-6 sm:py-6">
+          <div className="pointer-events-none fixed inset-x-0 top-20 z-[140] flex justify-center px-3 sm:px-4 md:px-5">
+            <div className="glass-panel pointer-events-auto w-full max-w-4xl !bg-card px-4 py-4 sm:px-6 sm:py-6">
               <ConnectionPanel
                 gatewayUrl={gatewayUrl}
                 token={token}
@@ -1619,6 +2373,7 @@ const AgentStudioPage = () => {
                 onTokenChange={setToken}
                 onConnect={() => void connect()}
                 onDisconnect={disconnect}
+                onClose={() => setShowConnectionPanel(false)}
               />
             </div>
           </div>
@@ -1633,44 +2388,35 @@ const AgentStudioPage = () => {
         ) : null}
         {configMutationStatusLine ? (
           <div className="w-full">
-            <div className="rounded-md border border-border/80 bg-card/80 px-4 py-2 font-mono text-[11px] uppercase tracking-[0.11em] text-muted-foreground">
+            <div className="ui-card px-4 py-2 font-mono text-[11px] tracking-[0.07em] text-muted-foreground">
               {configMutationStatusLine}
             </div>
           </div>
         ) : null}
 
         <div className="flex min-h-0 flex-1 flex-col gap-4 xl:flex-row">
-          <div className="glass-panel p-2 xl:hidden" data-testid="mobile-pane-toggle">
-            <div className="grid grid-cols-4 gap-2">
+          <div className="glass-panel ui-panel p-2 xl:hidden" data-testid="mobile-pane-toggle">
+            <div className="ui-segment grid-cols-4">
               <button
                 type="button"
-                className={`rounded-md border px-2 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.13em] transition ${
-                  mobilePane === "fleet"
-                    ? "border-border bg-muted text-foreground shadow-xs"
-                    : "border-border/80 bg-card/65 text-muted-foreground hover:border-border hover:bg-muted/70"
-                }`}
+                className="ui-segment-item px-2 py-2 font-mono text-[12px] font-medium tracking-[0.02em]"
+                data-active={mobilePane === "fleet" ? "true" : "false"}
                 onClick={() => setMobilePane("fleet")}
               >
                 Fleet
               </button>
               <button
                 type="button"
-                className={`rounded-md border px-2 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.13em] transition ${
-                  mobilePane === "chat"
-                    ? "border-border bg-muted text-foreground shadow-xs"
-                    : "border-border/80 bg-card/65 text-muted-foreground hover:border-border hover:bg-muted/70"
-                }`}
+                className="ui-segment-item px-2 py-2 font-mono text-[12px] font-medium tracking-[0.02em]"
+                data-active={mobilePane === "chat" ? "true" : "false"}
                 onClick={() => setMobilePane("chat")}
               >
                 Chat
               </button>
               <button
                 type="button"
-                className={`rounded-md border px-2 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.13em] transition ${
-                  mobilePane === "settings"
-                    ? "border-border bg-muted text-foreground shadow-xs"
-                    : "border-border/80 bg-card/65 text-muted-foreground hover:border-border hover:bg-muted/70"
-                }`}
+                className="ui-segment-item px-2 py-2 font-mono text-[12px] font-medium tracking-[0.02em]"
+                data-active={mobilePane === "settings" ? "true" : "false"}
                 onClick={() => setMobilePane("settings")}
                 disabled={!settingsAgent}
               >
@@ -1678,11 +2424,8 @@ const AgentStudioPage = () => {
               </button>
               <button
                 type="button"
-                className={`rounded-md border px-2 py-2 font-mono text-[10px] font-semibold uppercase tracking-[0.13em] transition ${
-                  mobilePane === "brain"
-                    ? "border-border bg-muted text-foreground shadow-xs"
-                    : "border-border/80 bg-card/65 text-muted-foreground hover:border-border hover:bg-muted/70"
-                }`}
+                className="ui-segment-item px-2 py-2 font-mono text-[12px] font-medium tracking-[0.02em]"
+                data-active={mobilePane === "brain" ? "true" : "false"}
                 onClick={() => {
                   setBrainPanelOpen(true);
                   setSettingsAgentId(null);
@@ -1703,7 +2446,7 @@ const AgentStudioPage = () => {
               filter={focusFilter}
               onFilterChange={handleFocusFilterChange}
               onCreateAgent={() => {
-                void handleCreateAgent();
+                handleOpenCreateAgentModal();
               }}
               createDisabled={status !== "connected" || createAgentBusy || state.loading}
               createBusy={createAgentBusy}
@@ -1715,30 +2458,41 @@ const AgentStudioPage = () => {
             />
           </div>
           <div
-            className={`${mobilePane === "chat" ? "flex" : "hidden"} glass-panel min-h-0 flex-1 overflow-hidden p-2 sm:p-3 xl:flex`}
+            className={`${mobilePane === "chat" ? "flex" : "hidden"} ui-panel min-h-0 flex-1 overflow-hidden xl:flex`}
             data-testid="focused-agent-panel"
           >
             {focusedAgent ? (
-              <AgentChatPanel
-                agent={focusedAgent}
-                isSelected={false}
-                canSend={status === "connected"}
-                models={gatewayModels}
-                stopBusy={stopBusyAgentId === focusedAgent.agentId}
-                onOpenSettings={() => handleOpenAgentSettings(focusedAgent.agentId)}
-                onModelChange={(value) =>
-                  handleModelChange(focusedAgent.agentId, focusedAgent.sessionKey, value)
-                }
-                onThinkingChange={(value) =>
-                  handleThinkingChange(focusedAgent.agentId, focusedAgent.sessionKey, value)
-                }
-                onDraftChange={(value) => handleDraftChange(focusedAgent.agentId, value)}
-                onSend={(message) =>
-                  handleSend(focusedAgent.agentId, focusedAgent.sessionKey, message)
-                }
-                onStopRun={() => handleStopRun(focusedAgent.agentId, focusedAgent.sessionKey)}
-                onAvatarShuffle={() => handleAvatarShuffle(focusedAgent.agentId)}
-              />
+              <div className="flex min-h-0 flex-1 flex-col">
+                <div className="min-h-0 flex-1">
+                  <AgentChatPanel
+                    agent={focusedAgent}
+                    isSelected={false}
+                    canSend={status === "connected"}
+                    models={gatewayModels}
+                    stopBusy={stopBusyAgentId === focusedAgent.agentId}
+                    stopDisabledReason={focusedAgentStopDisabledReason}
+                    onLoadMoreHistory={() => loadMoreAgentHistory(focusedAgent.agentId)}
+                    onOpenSettings={() => handleOpenAgentSettings(focusedAgent.agentId)}
+                    onOpenBrain={() => handleOpenAgentBrain(focusedAgent.agentId)}
+                    onModelChange={(value) =>
+                      handleModelChange(focusedAgent.agentId, focusedAgent.sessionKey, value)
+                    }
+                    onThinkingChange={(value) =>
+                      handleThinkingChange(focusedAgent.agentId, focusedAgent.sessionKey, value)
+                    }
+                    onDraftChange={(value) => handleDraftChange(focusedAgent.agentId, value)}
+                    onSend={(message) =>
+                      handleSend(focusedAgent.agentId, focusedAgent.sessionKey, message)
+                    }
+                    onStopRun={() => handleStopRun(focusedAgent.agentId, focusedAgent.sessionKey)}
+                    onAvatarShuffle={() => handleAvatarShuffle(focusedAgent.agentId)}
+                    pendingExecApprovals={focusedPendingExecApprovals}
+                    onResolveExecApproval={(id, decision) => {
+                      void handleResolveExecApproval(id, decision);
+                    }}
+                  />
+                </div>
+              </div>
             ) : (
               <EmptyStatePanel
                 title={hasAnyAgents ? "No agents match this filter." : "No agents available."}
@@ -1756,7 +2510,7 @@ const AgentStudioPage = () => {
           </div>
           {brainPanelOpen ? (
             <div
-              className={`${mobilePane === "brain" ? "block" : "hidden"} glass-panel min-h-0 w-full shrink-0 overflow-hidden p-0 xl:block xl:min-w-[360px] xl:max-w-[430px]`}
+              className={`${mobilePane === "brain" ? "block" : "hidden"} sidebar-shell glass-panel ui-panel min-h-0 w-full shrink-0 overflow-hidden p-0 xl:block xl:min-w-[360px] xl:max-w-[430px]`}
             >
               <AgentBrainPanel
                 client={client}
@@ -1771,7 +2525,7 @@ const AgentStudioPage = () => {
           ) : null}
           {settingsAgent ? (
             <div
-              className={`${mobilePane === "settings" ? "block" : "hidden"} glass-panel min-h-0 w-full shrink-0 overflow-hidden p-0 xl:block xl:min-w-[360px] xl:max-w-[430px]`}
+              className={`${mobilePane === "settings" ? "block" : "hidden"} sidebar-shell glass-panel ui-panel min-h-0 w-full shrink-0 overflow-hidden p-0 xl:block xl:min-w-[360px] xl:max-w-[430px]`}
             >
               <AgentSettingsPanel
                 key={settingsAgent.agentId}
@@ -1781,6 +2535,10 @@ const AgentStudioPage = () => {
                   setMobilePane("chat");
                 }}
                 onRename={(name) => handleRenameAgent(settingsAgent.agentId, name)}
+                permissionsDraft={settingsAgentPermissionsDraft ?? undefined}
+                onUpdateAgentPermissions={(draft) =>
+                  handleUpdateAgentPermissions(settingsAgent.agentId, draft)
+                }
                 onNewSession={() => handleNewSession(settingsAgent.agentId)}
                 onDelete={() => handleDeleteAgent(settingsAgent.agentId)}
                 canDelete={settingsAgent.agentId !== RESERVED_MAIN_AGENT_ID}
@@ -1793,8 +2551,10 @@ const AgentStudioPage = () => {
                 cronJobs={settingsCronJobs}
                 cronLoading={settingsCronLoading}
                 cronError={settingsCronError}
+                cronCreateBusy={cronCreateBusy}
                 cronRunBusyJobId={cronRunBusyJobId}
                 cronDeleteBusyJobId={cronDeleteBusyJobId}
+                onCreateCronJob={(draft) => handleCreateCronJob(settingsAgent.agentId, draft)}
                 onRunCronJob={(jobId) => handleRunCronJob(settingsAgent.agentId, jobId)}
                 onDeleteCronJob={(jobId) => handleDeleteCronJob(settingsAgent.agentId, jobId)}
                 heartbeats={settingsHeartbeats}
@@ -1813,26 +2573,42 @@ const AgentStudioPage = () => {
           ) : null}
         </div>
       </div>
+      {createAgentModalOpen ? (
+        <AgentCreateModal
+          open={createAgentModalOpen}
+          suggestedName={suggestedCreateAgentName}
+          busy={createAgentBusy}
+          submitError={createAgentModalError}
+          onClose={() => {
+            if (createAgentBusy) return;
+            setCreateAgentModalError(null);
+            setCreateAgentModalOpen(false);
+          }}
+          onSubmit={(payload) => {
+            void handleCreateAgentSubmit(payload);
+          }}
+        />
+      ) : null}
       {createAgentBlock && createAgentBlock.phase !== "queued" ? (
         <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/70 backdrop-blur-sm"
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/80"
           data-testid="agent-create-restart-modal"
           role="dialog"
           aria-modal="true"
-          aria-label="Creating agent and restarting gateway"
+          aria-label="Creating agent"
         >
-          <div className="w-full max-w-md rounded-lg border border-border bg-card/95 p-6 shadow-2xl">
-            <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+          <div className="ui-panel w-full max-w-md p-6">
+            <div className="font-mono text-[10px] font-semibold tracking-[0.06em] text-muted-foreground">
               Agent create in progress
             </div>
             <div className="mt-2 text-base font-semibold text-foreground">
               {createAgentBlock.agentName}
             </div>
             <div className="mt-3 text-sm text-muted-foreground">
-              Studio is temporarily locked until the gateway restarts.
+              Studio is temporarily locked until creation finishes.
             </div>
             {createBlockStatusLine ? (
-              <div className="mt-4 rounded-md border border-border/70 bg-muted/40 px-3 py-2 font-mono text-[11px] uppercase tracking-[0.12em] text-foreground">
+              <div className="ui-card mt-4 px-3 py-2 font-mono text-[11px] tracking-[0.06em] text-foreground">
                 {createBlockStatusLine}
               </div>
             ) : null}
@@ -1841,14 +2617,14 @@ const AgentStudioPage = () => {
       ) : null}
       {renameAgentBlock && renameAgentBlock.phase !== "queued" ? (
         <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/70 backdrop-blur-sm"
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/80"
           data-testid="agent-rename-restart-modal"
           role="dialog"
           aria-modal="true"
           aria-label="Renaming agent and restarting gateway"
         >
-          <div className="w-full max-w-md rounded-lg border border-border bg-card/95 p-6 shadow-2xl">
-            <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+          <div className="ui-panel w-full max-w-md p-6">
+            <div className="font-mono text-[10px] font-semibold tracking-[0.06em] text-muted-foreground">
               Agent rename in progress
             </div>
             <div className="mt-2 text-base font-semibold text-foreground">
@@ -1858,7 +2634,7 @@ const AgentStudioPage = () => {
               Studio is temporarily locked until the gateway restarts.
             </div>
             {renameBlockStatusLine ? (
-              <div className="mt-4 rounded-md border border-border/70 bg-muted/40 px-3 py-2 font-mono text-[11px] uppercase tracking-[0.12em] text-foreground">
+              <div className="ui-card mt-4 px-3 py-2 font-mono text-[11px] tracking-[0.06em] text-foreground">
                 {renameBlockStatusLine}
               </div>
             ) : null}
@@ -1867,14 +2643,14 @@ const AgentStudioPage = () => {
       ) : null}
       {deleteAgentBlock && deleteAgentBlock.phase !== "queued" ? (
         <div
-          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/70 backdrop-blur-sm"
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/80"
           data-testid="agent-delete-restart-modal"
           role="dialog"
           aria-modal="true"
           aria-label="Deleting agent and restarting gateway"
         >
-          <div className="w-full max-w-md rounded-lg border border-border bg-card/95 p-6 shadow-2xl">
-            <div className="font-mono text-[10px] font-semibold uppercase tracking-[0.16em] text-muted-foreground">
+          <div className="ui-panel w-full max-w-md p-6">
+            <div className="font-mono text-[10px] font-semibold tracking-[0.06em] text-muted-foreground">
               Agent delete in progress
             </div>
             <div className="mt-2 text-base font-semibold text-foreground">
@@ -1884,7 +2660,7 @@ const AgentStudioPage = () => {
               Studio is temporarily locked until the gateway restarts.
             </div>
             {deleteBlockStatusLine ? (
-              <div className="mt-4 rounded-md border border-border/70 bg-muted/40 px-3 py-2 font-mono text-[11px] uppercase tracking-[0.12em] text-foreground">
+              <div className="ui-card mt-4 px-3 py-2 font-mono text-[11px] tracking-[0.06em] text-foreground">
                 {deleteBlockStatusLine}
               </div>
             ) : null}

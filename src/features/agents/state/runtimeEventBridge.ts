@@ -3,11 +3,16 @@ import {
   extractText,
   extractThinking,
   extractToolLines,
+  formatMetaMarkdown,
   formatThinkingMarkdown,
   isHeartbeatPrompt,
+  isMetaMarkdown,
+  isToolMarkdown,
+  isTraceMarkdown,
   isUiMetadataPrefix,
   stripUiMetadata,
 } from "@/lib/text/message-extract";
+import { normalizeAssistantDisplayText } from "@/lib/text/assistantText";
 
 type LifecyclePhase = "start" | "end" | "error";
 
@@ -40,7 +45,7 @@ export type LifecycleTransition =
   | LifecycleTransitionIgnore;
 
 type ShouldPublishAssistantStreamInput = {
-  mergedRaw: string;
+  nextText: string;
   rawText: string;
   hasChatEvents: boolean;
   currentStreamText: string | null;
@@ -62,6 +67,8 @@ export type ChatEventPayload = {
   runId: string;
   sessionKey: string;
   state: "delta" | "final" | "aborted" | "error";
+  seq?: number;
+  stopReason?: string;
   message?: unknown;
   errorMessage?: string;
 };
@@ -214,10 +221,16 @@ export const buildHistoryLines = (messages: ChatHistoryMessage[]): HistoryLinesR
   let lastAssistantAt: number | null = null;
   let lastRole: string | null = null;
   let lastUser: string | null = null;
+  const isRestartSentinelMessage = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return false;
+    return /^(?:System:\s*\[[^\]]+\]\s*)?GatewayRestart:\s*\{/.test(trimmed);
+  };
   for (const message of messages) {
     const role = typeof message.role === "string" ? message.role : "other";
     const extracted = extractText(message);
-    const text = stripUiMetadata(extracted?.trim() ?? "");
+    const baseText = stripUiMetadata(extracted?.trim() ?? "");
+    const text = role === "assistant" ? normalizeAssistantDisplayText(baseText) : baseText;
     const thinking =
       role === "assistant" ? formatThinkingMarkdown(extractThinking(message) ?? "") : "";
     const toolLines = extractToolLines(message);
@@ -230,7 +243,12 @@ export const buildHistoryLines = (messages: ChatHistoryMessage[]): HistoryLinesR
     }
     if (role === "user") {
       if (text && isHeartbeatPrompt(text)) continue;
+      if (text && isRestartSentinelMessage(text)) continue;
       if (text) {
+        const at = extractMessageTimestamp(message);
+        if (typeof at === "number") {
+          lines.push(formatMetaMarkdown({ role: "user", timestamp: at }));
+        }
         lines.push(`> ${text}`);
         lastUser = text;
       }
@@ -239,6 +257,9 @@ export const buildHistoryLines = (messages: ChatHistoryMessage[]): HistoryLinesR
       const at = extractMessageTimestamp(message);
       if (typeof at === "number") {
         lastAssistantAt = at;
+      }
+      if (typeof at === "number") {
+        lines.push(formatMetaMarkdown({ role: "assistant", timestamp: at }));
       }
       if (thinking) {
         lines.push(thinking);
@@ -257,20 +278,43 @@ export const buildHistoryLines = (messages: ChatHistoryMessage[]): HistoryLinesR
       lines.push(text);
     }
   }
-  const deduped: string[] = [];
-  for (const line of lines) {
-    if (deduped[deduped.length - 1] === line) continue;
-    deduped.push(line);
-  }
-  return { lines: deduped, lastAssistant, lastAssistantAt, lastRole, lastUser };
+  return { lines, lastAssistant, lastAssistantAt, lastRole, lastUser };
 };
 
 export const mergeHistoryWithPending = (
   historyLines: string[],
   currentLines: string[]
 ): string[] => {
+  const normalizeUserLine = (line: string): string | null => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith(">")) return null;
+    const text = trimmed.replace(/^>\s?/, "");
+    const normalized = text.replace(/\s+/g, " ").trim();
+    return normalized || null;
+  };
+
+  const isPlainAssistantLine = (line: string): boolean => {
+    const trimmed = line.trim();
+    if (!trimmed) return false;
+    if (trimmed.startsWith(">")) return false;
+    if (isMetaMarkdown(trimmed)) return false;
+    if (isTraceMarkdown(trimmed)) return false;
+    if (isToolMarkdown(trimmed)) return false;
+    return true;
+  };
+
+  const countLines = (lines: string[]) => {
+    const counts = new Map<string, number>();
+    for (const line of lines) {
+      counts.set(line, (counts.get(line) ?? 0) + 1);
+    }
+    return counts;
+  };
+
   if (currentLines.length === 0) return historyLines;
   if (historyLines.length === 0) return historyLines;
+  const historyCounts = countLines(historyLines);
+  const currentCounts = countLines(currentLines);
   const merged = [...historyLines];
   let cursor = 0;
   for (const line of currentLines) {
@@ -285,10 +329,41 @@ export const mergeHistoryWithPending = (
       cursor = foundIndex + 1;
       continue;
     }
+    const normalizedUserLine = normalizeUserLine(line);
+    if (normalizedUserLine) {
+      for (let i = cursor; i < merged.length; i += 1) {
+        const normalizedMergedLine = normalizeUserLine(merged[i] ?? "");
+        if (!normalizedMergedLine) continue;
+        if (normalizedMergedLine !== normalizedUserLine) continue;
+        foundIndex = i;
+        break;
+      }
+      if (foundIndex !== -1) {
+        cursor = foundIndex + 1;
+        continue;
+      }
+    }
     merged.splice(cursor, 0, line);
     cursor += 1;
   }
-  return merged;
+  const assistantLineCount = new Map<string, number>();
+  const bounded: string[] = [];
+  for (const line of merged) {
+    if (!isPlainAssistantLine(line)) {
+      bounded.push(line);
+      continue;
+    }
+    const nextCount = (assistantLineCount.get(line) ?? 0) + 1;
+    const historyCount = historyCounts.get(line) ?? 0;
+    const currentCount = currentCounts.get(line) ?? 0;
+    const hasOverlap = historyCount > 0 && currentCount > 0;
+    if (hasOverlap && nextCount > historyCount) {
+      continue;
+    }
+    assistantLineCount.set(line, nextCount);
+    bounded.push(line);
+  }
+  return bounded;
 };
 
 export const buildHistorySyncPatch = ({
@@ -312,6 +387,7 @@ export const buildHistorySyncPatch = ({
     if (!runId && status === "running" && lastRole === "assistant") {
       patch.status = "idle";
       patch.runId = null;
+      patch.runStartedAt = null;
       patch.streamText = null;
       patch.thinkingTrace = null;
     }
@@ -328,6 +404,7 @@ export const buildHistorySyncPatch = ({
   if (!runId && status === "running" && lastRole === "assistant") {
     patch.status = "idle";
     patch.runId = null;
+    patch.runStartedAt = null;
     patch.streamText = null;
     patch.thinkingTrace = null;
   }
@@ -404,6 +481,7 @@ export const resolveLifecyclePatch = (input: LifecyclePatchInput): LifecycleTran
       patch: {
         status: "running",
         runId: incomingRunId,
+        runStartedAt: lastActivityAt,
         sessionCreated: true,
         lastActivityAt,
       },
@@ -419,6 +497,7 @@ export const resolveLifecyclePatch = (input: LifecyclePatchInput): LifecycleTran
       patch: {
         status: "error",
         runId: null,
+        runStartedAt: null,
         streamText: null,
         thinkingTrace: null,
         lastActivityAt,
@@ -431,6 +510,7 @@ export const resolveLifecyclePatch = (input: LifecyclePatchInput): LifecycleTran
     patch: {
       status: "idle",
       runId: null,
+      runStartedAt: null,
       streamText: null,
       thinkingTrace: null,
       lastActivityAt,
@@ -439,15 +519,19 @@ export const resolveLifecyclePatch = (input: LifecyclePatchInput): LifecycleTran
 };
 
 export const shouldPublishAssistantStream = ({
-  mergedRaw,
+  nextText,
   rawText,
   hasChatEvents,
   currentStreamText,
 }: ShouldPublishAssistantStreamInput): boolean => {
-  if (!mergedRaw.trim()) return false;
+  const next = nextText.trim();
+  if (!next) return false;
   if (!hasChatEvents) return true;
   if (rawText.trim()) return true;
-  return !currentStreamText?.trim();
+  const current = currentStreamText?.trim() ?? "";
+  if (!current) return true;
+  if (next.length <= current.length) return false;
+  return next.startsWith(current);
 };
 
 export const getChatSummaryPatch = (

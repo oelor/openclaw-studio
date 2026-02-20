@@ -64,7 +64,8 @@ test-results
 /agent-canvas
 /worktrees
 
-AGENTS.md
-
 # local issue tracker
 /.beads
+
+# bv (beads viewer) local config and caches
+.bv/

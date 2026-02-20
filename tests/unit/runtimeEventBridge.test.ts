@@ -15,6 +15,7 @@ import {
   resolveLifecyclePatch,
   shouldPublishAssistantStream,
 } from "@/features/agents/state/runtimeEventBridge";
+import { EXEC_APPROVAL_AUTO_RESUME_MARKER } from "@/lib/text/message-extract";
 
 describe("runtime event bridge helpers", () => {
   it("classifies gateway events by routing category", () => {
@@ -86,7 +87,7 @@ describe("runtime event bridge helpers", () => {
   it("suppresses assistant stream publish when chat stream already owns it", () => {
     expect(
       shouldPublishAssistantStream({
-        mergedRaw: "hello",
+        nextText: "hello",
         rawText: "",
         hasChatEvents: true,
         currentStreamText: "already streaming",
@@ -94,7 +95,7 @@ describe("runtime event bridge helpers", () => {
     ).toBe(false);
     expect(
       shouldPublishAssistantStream({
-        mergedRaw: "hello",
+        nextText: "hello",
         rawText: "",
         hasChatEvents: false,
         currentStreamText: "already streaming",
@@ -102,12 +103,20 @@ describe("runtime event bridge helpers", () => {
     ).toBe(true);
     expect(
       shouldPublishAssistantStream({
-        mergedRaw: "",
+        nextText: "",
         rawText: "",
         hasChatEvents: false,
         currentStreamText: null,
       })
     ).toBe(false);
+    expect(
+      shouldPublishAssistantStream({
+        nextText: "already streaming plus more",
+        rawText: "",
+        hasChatEvents: true,
+        currentStreamText: "already streaming",
+      })
+    ).toBe(true);
   });
 
   it("updates preview and activity from assistant chat", () => {
@@ -269,7 +278,7 @@ describe("runtime event bridge helpers", () => {
     ]);
   });
 
-  it("extracts history lines with heartbeat filtering, thinking/tool lines, and dedupe", () => {
+  it("extracts history lines with heartbeat filtering and preserves canonical repeats", () => {
     const history = buildHistoryLines([
       { role: "user", content: "Read HEARTBEAT.md if it exists\nHeartbeat file path: /tmp/HEARTBEAT.md" },
       { role: "user", content: "Project path: /tmp/project\n\nhello there" },
@@ -297,7 +306,10 @@ describe("runtime event bridge helpers", () => {
 
     expect(history.lines).toEqual([
       "> hello there",
+      '[[meta]]{"role":"assistant","timestamp":1704067200000}',
       "[[trace]]\n_step one_",
+      "assistant final",
+      '[[meta]]{"role":"assistant","timestamp":1704067201000}',
       "assistant final",
       "[[tool-result]] shell (call-1)\nok\n```text\ndone\n```",
     ]);
@@ -307,10 +319,108 @@ describe("runtime event bridge helpers", () => {
     expect(history.lastUser).toBe("hello there");
   });
 
+  it("does not render internal auto-resume user messages in reconstructed history", () => {
+    const history = buildHistoryLines([
+      {
+        role: "user",
+        content: `[Tue 2026-02-17 12:52 PST] ${EXEC_APPROVAL_AUTO_RESUME_MARKER}
+Continue where you left off and finish the task.`,
+      },
+      {
+        role: "assistant",
+        content: "resumed output",
+      },
+    ]);
+
+    expect(history.lines).toEqual(["resumed output"]);
+    expect(history.lastUser).toBeNull();
+  });
+
+  it("preserves markdown-rich assistant lines and explicit tool boundaries", () => {
+    const assistantMarkdown = [
+      "- item one",
+      "- item two",
+      "",
+      "```json",
+      '{"ok":true}',
+      "```",
+    ].join("\n");
+    const history = buildHistoryLines([
+      {
+        role: "assistant",
+        timestamp: "2024-01-01T00:00:00.000Z",
+        content: assistantMarkdown,
+      },
+      {
+        role: "assistant",
+        timestamp: "2024-01-01T00:00:01.000Z",
+        content: assistantMarkdown,
+      },
+      {
+        role: "toolResult",
+        toolName: "shell",
+        toolCallId: "call-2",
+        details: { status: "ok" },
+        text: "done",
+      },
+    ]);
+
+    expect(history.lines).toEqual([
+      '[[meta]]{"role":"assistant","timestamp":1704067200000}',
+      assistantMarkdown,
+      '[[meta]]{"role":"assistant","timestamp":1704067201000}',
+      assistantMarkdown,
+      "[[tool-result]] shell (call-2)\nok\n```text\ndone\n```",
+    ]);
+    expect(history.lastAssistant).toBe(assistantMarkdown);
+    expect(history.lastAssistantAt).toBe(Date.parse("2024-01-01T00:00:01.000Z"));
+    expect(history.lastRole).toBe("assistant");
+  });
+
+  it("normalizes assistant text in history reconstruction", () => {
+    const history = buildHistoryLines([
+      {
+        role: "assistant",
+        content: "\n- item one  \n\n\n- item two\t \n\n",
+      },
+    ]);
+
+    expect(history.lines).toEqual(["- item one\n\n- item two"]);
+    expect(history.lastAssistant).toBe("- item one\n\n- item two");
+    expect(history.lastRole).toBe("assistant");
+  });
+
   it("merges history lines with pending output order and preserves empty-history behavior", () => {
     expect(mergeHistoryWithPending(["a", "c"], ["a", "b", "c"])).toEqual(["a", "b", "c"]);
     expect(mergeHistoryWithPending([], ["a", "b"])).toEqual([]);
     expect(mergeHistoryWithPending(["a", "b"], [])).toEqual(["a", "b"]);
+  });
+
+  it("collapses duplicate plain assistant lines only when history and pending both contain them", () => {
+    expect(mergeHistoryWithPending(["> q", "final"], ["> q", "final", "final"])).toEqual([
+      "> q",
+      "final",
+    ]);
+    expect(mergeHistoryWithPending(["> q", "final", "final"], ["> q"])).toEqual([
+      "> q",
+      "final",
+      "final",
+    ]);
+  });
+
+  it("caps overlapping assistant duplicate counts to canonical history counts", () => {
+    expect(mergeHistoryWithPending(["a", "b", "a"], ["a", "a", "b", "a"])).toEqual([
+      "a",
+      "b",
+      "a",
+    ]);
+  });
+
+  it("preserves repeated tool and meta lines during history merge", () => {
+    const tool = "[[tool]] shell (call-1)\n```json\n{}\n```";
+    const meta = '[[meta]]{"role":"assistant","timestamp":1704067200000}';
+    expect(mergeHistoryWithPending([tool], [tool, tool])).toEqual([tool, tool]);
+    expect(mergeHistoryWithPending([meta], [meta, meta])).toEqual([meta, meta]);
   });
 
   it("builds history sync patches for empty, unchanged, and merged cases", () => {
@@ -338,10 +448,14 @@ describe("runtime event bridge helpers", () => {
       runId: null,
     });
     expect(unchanged).toEqual({
-      historyLoadedAt: 200,
+      outputLines: ['[[meta]]{"role":"assistant","timestamp":1704067200000}', "done"],
+      lastResult: "done",
+      latestPreview: "done",
       lastAssistantMessageAt: Date.parse("2024-01-01T00:00:00.000Z"),
+      historyLoadedAt: 200,
       status: "idle",
       runId: null,
+      runStartedAt: null,
       streamText: null,
       thinkingTrace: null,
     });
@@ -361,7 +475,7 @@ describe("runtime event bridge helpers", () => {
       runId: null,
     });
     expect(merged).toEqual({
-      outputLines: ["> hello", "pending line", "assistant final"],
+      outputLines: ["> hello", "pending line", '[[meta]]{"role":"assistant","timestamp":1704067202000}', "assistant final"],
       lastResult: "assistant final",
       latestPreview: "assistant final",
       lastAssistantMessageAt: Date.parse("2024-01-01T00:00:02.000Z"),
@@ -369,8 +483,56 @@ describe("runtime event bridge helpers", () => {
       historyLoadedAt: 300,
       status: "idle",
       runId: null,
+      runStartedAt: null,
       streamText: null,
       thinkingTrace: null,
+    });
+  });
+
+  it("prefers canonical history when optimistic user content differs only by whitespace", () => {
+    const patch = buildHistorySyncPatch({
+      messages: [
+        {
+          role: "user",
+          timestamp: "2024-01-01T00:00:03.000Z",
+          content: "line one line two",
+        },
+      ],
+      currentLines: ["> line one\n\nline two"],
+      loadedAt: 400,
+      status: "idle",
+      runId: null,
+    });
+
+    expect(patch).toEqual({
+      outputLines: ['[[meta]]{"role":"user","timestamp":1704067203000}', "> line one line two"],
+      lastResult: null,
+      lastUserMessage: "line one line two",
+      historyLoadedAt: 400,
+    });
+  });
+
+  it("collapses optimistic user lines when history carries a post-system timestamp envelope", () => {
+    const patch = buildHistorySyncPatch({
+      messages: [
+        {
+          role: "user",
+          timestamp: "2026-02-17T23:39:00.000Z",
+          content:
+            "System: [2026-02-17 23:38 UTC] queued\n\n[Tue 2026-02-17 23:39 UTC] Ask me some questions",
+        },
+      ],
+      currentLines: ["> Ask me some questions"],
+      loadedAt: 500,
+      status: "idle",
+      runId: null,
+    });
+
+    expect(patch).toEqual({
+      outputLines: ['[[meta]]{"role":"user","timestamp":1771371540000}', "> Ask me some questions"],
+      lastResult: null,
+      lastUserMessage: "Ask me some questions",
+      historyLoadedAt: 500,
     });
   });
 });

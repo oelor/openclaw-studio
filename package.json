@@ -3,17 +3,20 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev --webpack",
-    "dev:turbo": "next dev",
+    "dev": "node server/index.js --dev",
+    "dev:turbo": "node server/index.js --dev",
     "build": "next build",
-    "start": "next start",
+    "start": "node server/index.js",
     "lint": "eslint .",
     "cleanup:ux-artifacts": "node scripts/cleanup-ux-artifacts.mjs",
     "sync:gateway-client": "node scripts/sync-openclaw-gateway-client.ts",
     "migrate:architecture": "node scripts/migrate-architecture.ts",
+    "studio:setup": "node scripts/studio-setup.js",
+    "smoke:dev-server": "node scripts/smoke-dev-server.mjs",
     "typecheck": "tsc --noEmit",
     "test": "vitest",
-    "e2e": "playwright test"
+    "e2e": "playwright test",
+    "pw:open:max": "scripts/playwright-open-maximized.sh"
   },
   "dependencies": {
     "@multiavatar/multiavatar": "github:multiavatar/Multiavatar",
@@ -23,13 +26,14 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^0.563.0",
-    "next": "16.1.4",
+    "next": "16.1.6",
     "react": "19.2.3",
     "react-dom": "19.2.3",
     "react-markdown": "^10.1.0",
     "react-mentions-ts": "^5.4.7",
     "remark-gfm": "^4.0.1",
-    "tailwind-merge": "^3.4.0"
+    "tailwind-merge": "^3.4.0",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@playwright/test": "^1.58.0",
@@ -39,8 +43,9 @@
     "@types/node": "^20",
     "@types/react": "^19",
     "@types/react-dom": "^19",
+    "@types/ws": "^8.18.1",
     "eslint": "^9",
-    "eslint-config-next": "16.1.4",
+    "eslint-config-next": "16.1.6",
     "eslint-config-prettier": "^10.1.8",
     "jsdom": "^27.4.0",
     "prettier": "^3.8.1",

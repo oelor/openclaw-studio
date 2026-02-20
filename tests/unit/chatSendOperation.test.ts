@@ -2,38 +2,52 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { AgentState } from "@/features/agents/state/store";
 import { sendChatMessageViaStudio } from "@/features/agents/operations/chatSendOperation";
+import { formatMetaMarkdown } from "@/lib/text/message-extract";
 
-const createAgent = (overrides?: Partial<AgentState>): AgentState => ({
-  agentId: "agent-1",
-  name: "Agent One",
-  sessionKey: "agent:agent-1:studio:test-session",
-  status: "idle",
-  sessionCreated: false,
-  awaitingUserInput: false,
-  hasUnseenActivity: false,
-  outputLines: [],
-  lastResult: null,
-  lastDiff: null,
-  runId: null,
-  streamText: null,
-  thinkingTrace: null,
-  latestOverride: null,
-  latestOverrideKind: null,
-  lastAssistantMessageAt: null,
-  lastActivityAt: null,
-  latestPreview: null,
-  lastUserMessage: null,
-  draft: "",
-  sessionSettingsSynced: true,
-  historyLoadedAt: null,
-  toolCallingEnabled: true,
-  showThinkingTraces: true,
-  model: "openai/gpt-5",
-  thinkingLevel: "medium",
-  avatarSeed: "seed-1",
-  avatarUrl: null,
-  ...(overrides ?? {}),
-});
+const createAgent = (overrides?: Partial<AgentState>): AgentState => {
+  const base: AgentState = {
+    agentId: "agent-1",
+    name: "Agent One",
+    sessionKey: "agent:agent-1:studio:test-session",
+    status: "idle",
+    sessionCreated: false,
+    awaitingUserInput: false,
+    hasUnseenActivity: false,
+    outputLines: [],
+    lastResult: null,
+    lastDiff: null,
+    runId: null,
+    runStartedAt: null,
+    streamText: null,
+    thinkingTrace: null,
+    latestOverride: null,
+    latestOverrideKind: null,
+    lastAssistantMessageAt: null,
+    lastActivityAt: null,
+    latestPreview: null,
+    lastUserMessage: null,
+    draft: "",
+    sessionSettingsSynced: true,
+    historyLoadedAt: null,
+    historyFetchLimit: null,
+    historyFetchedCount: null,
+    historyMaybeTruncated: false,
+    toolCallingEnabled: true,
+    showThinkingTraces: true,
+    model: "openai/gpt-5",
+    thinkingLevel: "medium",
+    avatarSeed: "seed-1",
+    avatarUrl: null,
+  };
+  const merged = { ...base, ...(overrides ?? {}) };
+
+  return {
+    ...merged,
+    historyFetchLimit: merged.historyFetchLimit ?? null,
+    historyFetchedCount: merged.historyFetchedCount ?? null,
+    historyMaybeTruncated: merged.historyMaybeTruncated ?? false,
+  };
+};
 
 describe("sendChatMessageViaStudio", () => {
   it("handles_reset_command", async () => {
@@ -62,16 +76,19 @@ describe("sendChatMessageViaStudio", () => {
     });
 
     expect(clearRunTracking).toHaveBeenCalledWith("run-1");
-    expect(dispatch).toHaveBeenCalledWith({
-      type: "updateAgent",
-      agentId: agent.agentId,
-      patch: {
-        outputLines: [],
-        streamText: null,
-        thinkingTrace: null,
-        lastResult: null,
-      },
-    });
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "updateAgent",
+        agentId: agent.agentId,
+        patch: expect.objectContaining({
+          outputLines: [],
+          streamText: null,
+          thinkingTrace: null,
+          lastResult: null,
+          transcriptEntries: [],
+        }),
+      })
+    );
   });
 
   it("syncs_session_settings_when_not_synced", async () => {
@@ -102,11 +119,62 @@ describe("sendChatMessageViaStudio", () => {
 
     const methods = call.mock.calls.map((entry) => entry[0]);
     expect(methods).toEqual(["sessions.patch", "chat.send"]);
+    expect(call).toHaveBeenCalledWith(
+      "sessions.patch",
+      expect.objectContaining({
+        key: agent.sessionKey,
+        model: "openai/gpt-5",
+        thinkingLevel: "medium",
+      })
+    );
     expect(dispatch).toHaveBeenCalledWith({
       type: "updateAgent",
       agentId: agent.agentId,
       patch: { sessionSettingsSynced: true, sessionCreated: true },
     });
+  });
+
+  it("syncs exec session overrides for ask-first agents", async () => {
+    const agent = createAgent({
+      sessionSettingsSynced: false,
+      sessionCreated: false,
+      sessionExecHost: "gateway",
+      sessionExecSecurity: "allowlist",
+      sessionExecAsk: "always",
+    });
+    const dispatch = vi.fn();
+    const call = vi.fn(async (method: string) => {
+      if (method === "sessions.patch") {
+        return {
+          ok: true,
+          key: agent.sessionKey,
+          entry: { thinkingLevel: "medium" },
+          resolved: { modelProvider: "openai", model: "gpt-5" },
+        };
+      }
+      return { ok: true };
+    });
+
+    await sendChatMessageViaStudio({
+      client: { call },
+      dispatch,
+      getAgent: () => agent,
+      agentId: agent.agentId,
+      sessionKey: agent.sessionKey,
+      message: "hello",
+      now: () => 1234,
+      generateRunId: () => "run-1",
+    });
+
+    expect(call).toHaveBeenCalledWith(
+      "sessions.patch",
+      expect.objectContaining({
+        key: agent.sessionKey,
+        execHost: "gateway",
+        execSecurity: "allowlist",
+        execAsk: "always",
+      })
+    );
   });
 
   it("does_not_sync_session_settings_when_already_synced", async () => {
@@ -135,6 +203,38 @@ describe("sendChatMessageViaStudio", () => {
     );
   });
 
+  it("supports_internal_send_without_local_user_echo", async () => {
+    const agent = createAgent({ sessionSettingsSynced: true });
+    const dispatch = vi.fn();
+    const call = vi.fn(async () => ({ ok: true }));
+
+    await sendChatMessageViaStudio({
+      client: { call },
+      dispatch,
+      getAgent: () => agent,
+      agentId: agent.agentId,
+      sessionKey: agent.sessionKey,
+      message: "internal follow-up",
+      echoUserMessage: false,
+      now: () => 1234,
+      generateRunId: () => "run-1",
+    });
+
+    const dispatchedActions = dispatch.mock.calls.map((entry) => entry[0]);
+    expect(
+      dispatchedActions.some(
+        (action) => action.type === "appendOutput" && action.line === "> internal follow-up"
+      )
+    ).toBe(false);
+    const runningUpdate = dispatchedActions.find(
+      (action) => action.type === "updateAgent" && action.patch?.status === "running"
+    );
+    expect(runningUpdate).toBeTruthy();
+    if (runningUpdate && runningUpdate.type === "updateAgent") {
+      expect(runningUpdate.patch.lastUserMessage).toBeUndefined();
+    }
+  });
+
   it("marks_error_on_gateway_failure", async () => {
     const agent = createAgent({ sessionSettingsSynced: true });
     const dispatch = vi.fn();
@@ -159,7 +259,7 @@ describe("sendChatMessageViaStudio", () => {
     expect(dispatch).toHaveBeenCalledWith({
       type: "updateAgent",
       agentId: agent.agentId,
-      patch: { status: "error", runId: null, streamText: null, thinkingTrace: null },
+      patch: { status: "error", runId: null, runStartedAt: null, streamText: null, thinkingTrace: null },
     });
     expect(dispatch).toHaveBeenCalledWith({
       type: "appendOutput",
@@ -167,5 +267,126 @@ describe("sendChatMessageViaStudio", () => {
       line: "Error: boom",
     });
   });
-});
 
+  it("optimistically_appends_only_user_content_line", async () => {
+    const agent = createAgent({ sessionSettingsSynced: true });
+    const dispatch = vi.fn();
+    const call = vi.fn(async () => ({ ok: true }));
+
+    await sendChatMessageViaStudio({
+      client: { call },
+      dispatch,
+      getAgent: () => agent,
+      agentId: agent.agentId,
+      sessionKey: agent.sessionKey,
+      message: "Hello world",
+      now: () => 1234,
+      generateRunId: () => "run-1",
+    });
+
+    const appendLines = dispatch.mock.calls
+      .map((entry) => entry[0])
+      .filter((action): action is { type: "appendOutput"; line: string } => {
+        return Boolean(
+          action &&
+            typeof action === "object" &&
+            "type" in action &&
+            action.type === "appendOutput" &&
+            "line" in action &&
+            typeof action.line === "string"
+        );
+      })
+      .map((action) => action.line);
+
+    expect(appendLines).toContain("> Hello world");
+    expect(appendLines.some((line) => line.startsWith("[[meta]]"))).toBe(false);
+  });
+
+  it("uses_monotonic_timestamp_for_optimistic_user_turn_ordering", async () => {
+    const sessionKey = "agent:agent-1:studio:test-session";
+    const agent = createAgent({
+      sessionSettingsSynced: true,
+      transcriptEntries: [
+        {
+          entryId: "history:assistant:1",
+          role: "assistant",
+          kind: "assistant",
+          text: "previous assistant",
+          sessionKey,
+          runId: null,
+          source: "history",
+          timestampMs: 5000,
+          sequenceKey: 10,
+          confirmed: true,
+          fingerprint: "fp-prev-assistant",
+        },
+      ],
+    });
+    const dispatch = vi.fn();
+    const call = vi.fn(async () => ({ ok: true }));
+
+    await sendChatMessageViaStudio({
+      client: { call },
+      dispatch,
+      getAgent: () => agent,
+      agentId: agent.agentId,
+      sessionKey: agent.sessionKey,
+      message: "new message",
+      now: () => 1000,
+      generateRunId: () => "run-1",
+    });
+
+    const optimisticUserAppend = dispatch.mock.calls
+      .map((entry) => entry[0])
+      .find(
+        (action) =>
+          action &&
+          typeof action === "object" &&
+          "type" in action &&
+          action.type === "appendOutput" &&
+          "line" in action &&
+          action.line === "> new message"
+      );
+    expect(optimisticUserAppend).toBeTruthy();
+    expect((optimisticUserAppend as { transcript?: { timestampMs?: number } }).transcript?.timestampMs).toBe(5001);
+  });
+
+  it("uses_output_meta_timestamps_when_transcript_entries_are_missing", async () => {
+    const sessionKey = "agent:agent-1:studio:test-session";
+    const agent = createAgent({
+      sessionSettingsSynced: true,
+      transcriptEntries: undefined,
+      outputLines: [
+        formatMetaMarkdown({ role: "assistant", timestamp: 12_000 }),
+        "previous assistant",
+      ],
+    });
+    const dispatch = vi.fn();
+    const call = vi.fn(async () => ({ ok: true }));
+
+    await sendChatMessageViaStudio({
+      client: { call },
+      dispatch,
+      getAgent: () => agent,
+      agentId: agent.agentId,
+      sessionKey,
+      message: "new message",
+      now: () => 1000,
+      generateRunId: () => "run-1",
+    });
+
+    const optimisticUserAppend = dispatch.mock.calls
+      .map((entry) => entry[0])
+      .find(
+        (action) =>
+          action &&
+          typeof action === "object" &&
+          "type" in action &&
+          action.type === "appendOutput" &&
+          "line" in action &&
+          action.line === "> new message"
+      );
+    expect(optimisticUserAppend).toBeTruthy();
+    expect((optimisticUserAppend as { transcript?: { timestampMs?: number } }).transcript?.timestampMs).toBe(12_001);
+  });
+});

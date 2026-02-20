@@ -2,8 +2,15 @@ import { useCallback, useEffect, useState } from "react";
 
 import { shouldStartNextConfigMutation } from "@/features/agents/operations/configMutationGatePolicy";
 import type { GatewayStatus } from "@/features/agents/operations/gatewayRestartPolicy";
+import { randomUUID } from "@/lib/uuid";
 
-export type ConfigMutationKind = "create-agent" | "rename-agent" | "delete-agent";
+export type ConfigMutationKind =
+  | "create-agent"
+  | "rename-agent"
+  | "delete-agent"
+  | "update-agent-execution-role"
+  | "update-agent-permissions"
+  | "repair-sandbox-tool-allowlist";
 
 type QueuedConfigMutation = {
   id: string;
@@ -33,7 +40,7 @@ export function useConfigMutationQueue(params: {
     (params: { kind: ConfigMutationKind; label: string; run: () => Promise<void> }) =>
       new Promise<void>((resolve, reject) => {
         const queued: QueuedConfigMutation = {
-          id: crypto.randomUUID(),
+          id: randomUUID(),
           kind: params.kind,
           label: params.label,
           run: params.run,
@@ -99,4 +106,3 @@ export function useConfigMutationQueue(params: {
       : null,
   };
 }
-
