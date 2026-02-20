@@ -6,7 +6,7 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 const HOME = process.env.HOME ?? "/Users/miloantaeus";
-const GOALS_DIR = path.join(HOME, "personal-ai-assistant-goals");
+const REPO_DIR = path.join(HOME, "personal-ai-assistant");
 const OPENCLAW_DIR = path.join(HOME, ".openclaw");
 
 type Initiative = {
@@ -23,6 +23,19 @@ type TaskQueueItem = {
   status: string;
 };
 
+type TradingPortfolio = {
+  balance: number;
+  initialBalance: number;
+  totalTrades: number;
+  recentTrades: Array<{
+    market: string;
+    position: string;
+    outcome: string;
+    pnl: number;
+    timestamp: string;
+  }>;
+};
+
 type ObserveContext = {
   recentMemory: string | null;
   initiatives: Initiative[];
@@ -35,6 +48,8 @@ type ObserveContext = {
     lastRunAt: string | null;
     nextRunAt: string | null;
   }>;
+  trading: TradingPortfolio | null;
+  recentDaemonActivity: string | null;
   systemInfo: {
     model: string;
     agentCount: number;
@@ -51,7 +66,7 @@ const readFileSafe = (filePath: string): string | null => {
 
 const parseRecentMemory = (): string | null => {
   const memoryDir = path.join(
-    GOALS_DIR,
+    REPO_DIR,
     "openclaw/workspace/skills/notes/data/memory/hourly"
   );
   try {
@@ -73,36 +88,47 @@ const parseRecentMemory = (): string | null => {
 
 const parseInitiatives = (): Initiative[] => {
   const content = readFileSafe(
-    path.join(GOALS_DIR, "openclaw/workspace/INITIATIVES.md")
+    path.join(REPO_DIR, "openclaw/workspace/INITIATIVES.md")
   );
   if (!content) return [];
 
   const initiatives: Initiative[] = [];
   const lines = content.split("\n");
   let current: Partial<Initiative> | null = null;
-  let priority = 1;
 
   for (const line of lines) {
-    // Match initiative headers like "### 1. Title (Priority)"
-    const headerMatch = line.match(
-      /^###\s+\d+\.\s+(.+?)(?:\s*\(([^)]+)\))?\s*$/
+    // Match "## P0 — Title" or "## P1.5 — Title" or "### 1. Title (Priority)"
+    const pMatch = line.match(
+      /^##\s+(P[\d.]+)\s*[—–-]\s*(.+)$/
     );
-    if (headerMatch) {
+    const numMatch = !pMatch
+      ? line.match(/^###?\s+\d+\.\s+(.+?)(?:\s*\(([^)]+)\))?\s*$/)
+      : null;
+
+    if (pMatch || numMatch) {
       if (current?.title) {
         initiatives.push(current as Initiative);
       }
-      current = {
-        title: headerMatch[1].trim(),
-        priority: headerMatch[2]?.trim() ?? `P${priority}`,
-        status: "active",
-        summary: "",
-      };
-      priority++;
+      if (pMatch) {
+        current = {
+          title: pMatch[2].trim(),
+          priority: pMatch[1].trim(),
+          status: "active",
+          summary: "",
+        };
+      } else if (numMatch) {
+        current = {
+          title: numMatch[1].trim(),
+          priority: numMatch[2]?.trim() ?? `P${initiatives.length + 1}`,
+          status: "active",
+          summary: "",
+        };
+      }
       continue;
     }
-    // Collect first non-empty line as summary
-    if (current && !current.summary && line.trim() && !line.startsWith("#")) {
-      current.summary = line.trim().slice(0, 150);
+    // Collect first bullet point as summary
+    if (current && !current.summary && line.trim().startsWith("-")) {
+      current.summary = line.trim().slice(2).trim().slice(0, 150);
     }
     // Detect status markers
     if (current && line.toLowerCase().includes("blocked")) {
@@ -184,6 +210,59 @@ const parseCronJobs = (): ObserveContext["cronJobs"] => {
   }
 };
 
+const parseTradingPortfolio = (): TradingPortfolio | null => {
+  const content = readFileSafe(
+    path.join(REPO_DIR, "income/passive-income/data/trades/portfolio.json")
+  );
+  if (!content) return null;
+
+  try {
+    const data = JSON.parse(content) as {
+      balance?: number;
+      initial_balance?: number;
+      trades?: Array<{
+        market?: string;
+        position?: string;
+        outcome?: string;
+        pnl?: number;
+        timestamp?: string;
+        created_at?: string;
+      }>;
+    };
+    const trades = (data.trades ?? [])
+      .slice(-10)
+      .reverse()
+      .map((t) => ({
+        market: t.market ?? "unknown",
+        position: t.position ?? "unknown",
+        outcome: t.outcome ?? "open",
+        pnl: t.pnl ?? 0,
+        timestamp: t.timestamp ?? t.created_at ?? "",
+      }));
+    return {
+      balance: data.balance ?? 0,
+      initialBalance: data.initial_balance ?? 1000,
+      totalTrades: (data.trades ?? []).length,
+      recentTrades: trades,
+    };
+  } catch {
+    return null;
+  }
+};
+
+const parseRecentDaemonActivity = (): string | null => {
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+  const logFile = path.join(
+    OPENCLAW_DIR,
+    `logs/imessage_daemon_${today}.log`
+  );
+  const content = readFileSafe(logFile);
+  if (!content) return null;
+  const lines = content.split("\n").filter(Boolean);
+  return lines.slice(-30).join("\n") || null;
+};
+
 const countAgents = (): number => {
   const agentsDir = path.join(OPENCLAW_DIR, "agents");
   try {
@@ -204,8 +283,10 @@ export async function GET() {
       initiatives: parseInitiatives(),
       taskQueue: parseTaskQueue(),
       cronJobs: parseCronJobs(),
+      trading: parseTradingPortfolio(),
+      recentDaemonActivity: parseRecentDaemonActivity(),
       systemInfo: {
-        model: "qwen2.5:14b",
+        model: "qwen3:30b-a3b",
         agentCount: countAgents(),
       },
     };
